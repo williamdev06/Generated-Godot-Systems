@@ -4,7 +4,7 @@ extends EditorPlugin
 # DEPENDS:    VoxelTerrain (get_density, get_type, set_voxel, set_voxels, voxel_types), VoxelChunk,
 #             EditorUndoRedoManager, RenderingServer
 # INVARIANTS: Edits go through _set_voxel only, so they land in the terrain's saved data
-#             (authored_chunks or storage, D-17, D-25) and in the stroke's undo delta.
+#             (storage or model, D-25, D-26) and in the stroke's undo delta.
 # GOTCHAS:    Picking marches the density samples in terrain-local space, not the meshes (chunks
 #             have no collision); chunks without data read as air, so rays pass through them.
 #             Sculpt and flatten write distance below the surface mapped to density
