@@ -1,0 +1,67 @@
+// OWNS:       Per-frame parameter block and screen <-> world helpers for per-frame passes.
+// DEPENDS:    VolumetricSkyEffect._update_params writes this block.
+// INVARIANTS: Field order and size match _update_params packing (INV-2). Always set 0, binding 0.
+// GOTCHAS:    RenderSceneDataRD.get_cam_projection() is already depth-corrected (verified on 4.7 D3D12):
+//             NDC z is the raw reverse-Z depth (1 near, 0 far) and NDC y = uv.y * 2 - 1.
+
+layout(set = 0, binding = 0, std140) uniform Params {
+	mat4 inv_view_projection;      // world meters
+	mat4 previous_view_projection; // world meters
+	vec4 camera_position;          // xyz world meters, w altitude km
+	vec4 sun_direction;            // xyz unit vector toward the sun
+	vec4 sun_illuminance;          // rgb, see INV-4
+	vec4 cloud_settings;           // x coverage, y extinction per km, z weather map size km (0 = procedural), w checkerboard block size (1 = off, 2 = on)
+	vec4 wind;                     // xy velocity along world x/z, km/s
+	vec4 render_size;              // xy cloud texture size, zw full resolution
+	vec4 frame;                    // x time seconds, y frame index, z 1 when cloud history is valid
+	vec4 cloud_shadow_area;        // xy shadow map center (world x/z m), z shadow map size m
+	// Beer shadow map frame, in cloud space (km: world x, altitude, world z). Tangent/bitangent span
+	// the map plane perpendicular to the sun.
+	vec4 beer_shadow_center;       // xyz map center
+	vec4 beer_shadow_tangent;      // xyz map u axis, w map extent km
+	vec4 beer_shadow_bitangent;    // xyz map v axis
+	vec4 atmosphere_settings;      // x haze (Mie density scale), y shaft strength (0..1), z froxel temporal amount (0 = no jitter/history), w shaft intensity
+	vec4 previous_camera_position; // xyz world meters, w 1 when froxel history is valid
+	vec4 cloud_layer;              // x bottom km, y top km, z max render distance km, w detail erosion
+	vec4 cloud_noise;              // x shape / y detail / z weather noise period km, w procedural coverage variation
+	vec4 cloud_lighting;           // x forward anisotropy, y back anisotropy, z back-lobe blend, w multi-scattering falloff
+	vec4 cloud_lighting_2;         // x ambient strength, y self-shadow march distance km, z cloud albedo
+	vec4 cloud_quality;            // x view steps, y light steps, z cloud temporal amount (history share), w detail LOD distance km
+	vec4 ground_albedo;            // rgb ground albedo (multi-scattering LUT and cloud ground bounce)
+} params;
+
+vec3 world_from_screen(vec2 uv, float depth) {
+	vec4 world = params.inv_view_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	return world.xyz / world.w;
+}
+
+vec3 view_direction(vec2 uv) {
+	return normalize(world_from_screen(uv, 0.0) - params.camera_position.xyz);
+}
+
+const float SKY_DISTANCE_KM = 1e6;
+
+// Camera distance to the opaque surface at a full-res pixel; SKY_DISTANCE_KM where nothing was drawn.
+float scene_distance_km(sampler2D depth_texture, ivec2 full_pixel) {
+	float depth = texelFetch(depth_texture, full_pixel, 0).r;
+	if (depth == 0.0) {
+		return SKY_DISTANCE_KM;
+	}
+	vec2 uv = (vec2(full_pixel) + 0.5) / params.render_size.zw;
+	return length(world_from_screen(uv, depth) - params.camera_position.xyz) * 0.001;
+}
+
+// The pixel inside each checkerboard block that clouds_raymarch traces this frame; all four positions of
+// a 2x2 block are visited every 4 frames in Bayer order. (0, 0) when checkerboarding is off.
+ivec2 checkerboard_offset() {
+	if (params.cloud_settings.w < 1.5) {
+		return ivec2(0);
+	}
+	const ivec2 BAYER_ORDER[4] = ivec2[4](ivec2(0, 0), ivec2(1, 1), ivec2(1, 0), ivec2(0, 1));
+	return BAYER_ORDER[int(params.frame.y) % 4];
+}
+
+// The full-res pixel whose depth bounds a half-res cloud texel's raymarch.
+ivec2 cloud_texel_full_pixel(ivec2 cloud_texel) {
+	return ivec2((vec2(cloud_texel) + 0.5) / params.render_size.xy * params.render_size.zw);
+}

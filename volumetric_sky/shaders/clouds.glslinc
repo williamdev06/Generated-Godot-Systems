@@ -1,0 +1,221 @@
+// OWNS:       Cloud density model (coverage, type, shape/detail noise) and the lit cloud raymarch.
+// DEPENDS:    params.glslinc and atmosphere.glslinc included first; samplers transmittance_lut,
+//             sky_view_lut, shape_noise, detail_noise, weather_map and procedural_weather declared.
+// INVARIANTS: Returned luminance is in the units of params.sun_illuminance (INV-4).
+// GOTCHAS:    The cloud shell curves with the planet around the camera (D-2) while noise is sampled
+//             at world x/z + altitude, so clouds stay fixed in the world as the camera moves.
+//             All tunables come from VolumetricSkyEffect settings via params.
+
+#define CLOUD_BOTTOM_KM params.cloud_layer.x
+#define CLOUD_TOP_KM params.cloud_layer.y
+#define CLOUD_MAX_DISTANCE_KM params.cloud_layer.z
+#define SHAPE_NOISE_PERIOD_KM params.cloud_noise.x
+#define DETAIL_NOISE_PERIOD_KM params.cloud_noise.y
+#define WEATHER_NOISE_PERIOD_KM params.cloud_noise.z
+#define LIGHT_MARCH_DISTANCE_KM params.cloud_lighting_2.y
+
+struct CloudSample {
+	vec3 luminance;
+	float transmittance;
+	float distance_km; // transmittance-weighted depth; used for reprojection and aerial perspective
+};
+
+float remap(float value, float old_min, float old_max, float new_min, float new_max) {
+	return new_min + (value - old_min) / (old_max - old_min) * (new_max - new_min);
+}
+
+// x = coverage, y = cloud type (0 stratus, 0.5 stratocumulus, 1 cumulus).
+vec2 sample_weather(vec2 position_xz_km) {
+	if (params.cloud_settings.z > 0.0) {
+		// The weather map is centered on the world origin.
+		vec2 weather = textureLod(weather_map, position_xz_km / params.cloud_settings.z + 0.5, 0.0).rg;
+		return vec2(weather.r * params.cloud_settings.x, weather.g);
+	}
+	// procedural_weather r/g span ~0..1 (stretched in weather_gen.glsl).
+	vec2 noise = textureLod(procedural_weather, position_xz_km / WEATHER_NOISE_PERIOD_KM, 0.0).rg;
+	return vec2(clamp(params.cloud_settings.x + (noise.r - 0.5) * params.cloud_noise.w, 0.0, 1.0), noise.g);
+}
+
+float height_profile(float height_fraction, float cloud_type) {
+	// (fade-in start, fade-in end, fade-out start, fade-out end) as fractions of the cloud layer.
+	const vec4 STRATUS = vec4(0.0, 0.05, 0.1, 0.2);
+	const vec4 STRATOCUMULUS = vec4(0.0, 0.1, 0.3, 0.5);
+	const vec4 CUMULUS = vec4(0.0, 0.1, 0.6, 1.0);
+	vec4 profile = cloud_type < 0.5 ? mix(STRATUS, STRATOCUMULUS, cloud_type * 2.0) : mix(STRATOCUMULUS, CUMULUS, cloud_type * 2.0 - 1.0);
+	return smoothstep(profile.x, profile.y, height_fraction) * (1.0 - smoothstep(profile.z, profile.w, height_fraction));
+}
+
+// Coverage-shaped base density 0..1 at `noise_position` (world x/z km, y = altitude km, wind applied).
+// Cheap (one shape lookup): 0 means empty space, which the raymarch uses to take bigger steps.
+float cloud_base_density(vec3 noise_position, float height_fraction, vec2 weather) {
+	float base = textureLod(shape_noise, noise_position / SHAPE_NOISE_PERIOD_KM, 0.0).r * height_profile(height_fraction, weather.y);
+	float coverage = weather.x;
+	return clamp((base - (1.0 - coverage)) / max(coverage, 1e-4), 0.0, 1.0) * coverage;
+}
+
+// Erodes a non-zero base density with detail noise; erosion_scale 0..1 fades it out with distance.
+float erode_cloud_density(float base, vec3 noise_position, float height_fraction, float erosion_scale) {
+	vec4 detail = textureLod(detail_noise, noise_position / DETAIL_NOISE_PERIOD_KM, 0.0);
+	float detail_fbm = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
+	// Wispy erosion at the cloud base, billowy erosion above it.
+	float detail_modifier = mix(detail_fbm, 1.0 - detail_fbm, clamp(height_fraction * 10.0, 0.0, 1.0));
+	return clamp(remap(base, detail_modifier * params.cloud_layer.w * erosion_scale, 1.0, 0.0, 1.0), 0.0, 1.0);
+}
+
+// Extinction per km at `noise_position` (world x/z km, y = altitude km, wind already applied).
+float cloud_extinction(vec3 noise_position, float height_fraction, vec2 weather, bool include_detail) {
+	float base = cloud_base_density(noise_position, height_fraction, weather);
+	if (base <= 0.0 || !include_detail) {
+		return base * params.cloud_settings.y;
+	}
+	return erode_cloud_density(base, noise_position, height_fraction, 1.0) * params.cloud_settings.y;
+}
+
+// Dual-lobe phase: strong forward peak for silver linings, weak back-scatter.
+float cloud_phase(float cos_theta, float anisotropy_scale) {
+	float forward = henyey_greenstein(cos_theta, params.cloud_lighting.x * anisotropy_scale);
+	float back = henyey_greenstein(cos_theta, params.cloud_lighting.y * anisotropy_scale);
+	return mix(forward, back, params.cloud_lighting.z);
+}
+
+// `weather` is the sample's own: it varies over tens of km, so the short march toward the sun reuses it.
+float optical_depth_to_sun(vec3 planet_position, vec3 noise_position, vec3 sun_direction, int step_count, vec2 weather) {
+	float optical_depth = 0.0;
+	float previous_distance_km = 0.0;
+	for (int i = 1; i <= step_count; i++) {
+		// Quadratic spacing: dense near the sample for self-shadow detail, sparse further out.
+		float fraction = float(i) / float(step_count);
+		float distance_km = LIGHT_MARCH_DISTANCE_KM * fraction * fraction;
+		float step_km = distance_km - previous_distance_km;
+		float midpoint_km = distance_km - 0.5 * step_km;
+		previous_distance_km = distance_km;
+		float altitude_km = length(planet_position + sun_direction * midpoint_km) - GROUND_RADIUS_KM;
+		float height_fraction = (altitude_km - CLOUD_BOTTOM_KM) / (CLOUD_TOP_KM - CLOUD_BOTTOM_KM);
+		if (height_fraction < 0.0 || height_fraction > 1.0) {
+			continue;
+		}
+		vec3 sample_position = noise_position + sun_direction * midpoint_km;
+		sample_position.y = altitude_km;
+		optical_depth += cloud_base_density(sample_position, height_fraction, weather) * params.cloud_settings.y * step_km;
+	}
+	return optical_depth;
+}
+
+CloudSample march_clouds(vec3 direction, float max_distance_km, float jitter, int step_count, int light_step_count, bool include_detail) {
+	CloudSample result = CloudSample(vec3(0.0), 1.0, min(max_distance_km, CLOUD_MAX_DISTANCE_KM));
+	float altitude = params.camera_position.w;
+	vec3 camera_planet = vec3(0.0, GROUND_RADIUS_KM + altitude, 0.0);
+	vec2 inner_hit = ray_sphere(camera_planet, direction, GROUND_RADIUS_KM + CLOUD_BOTTOM_KM);
+	vec2 outer_hit = ray_sphere(camera_planet, direction, GROUND_RADIUS_KM + CLOUD_TOP_KM);
+	float start_km;
+	float end_km;
+	if (altitude < CLOUD_BOTTOM_KM) {
+		if (ray_sphere(camera_planet, direction, GROUND_RADIUS_KM).x > 0.0) {
+			return result;
+		}
+		start_km = inner_hit.y;
+		end_km = outer_hit.y;
+	} else if (altitude > CLOUD_TOP_KM) {
+		if (outer_hit.x < 0.0) {
+			return result;
+		}
+		start_km = outer_hit.x;
+		end_km = inner_hit.x > 0.0 ? inner_hit.x : outer_hit.y;
+	} else {
+		start_km = 0.0;
+		end_km = inner_hit.x > 0.0 ? inner_hit.x : outer_hit.y;
+	}
+	end_km = min(end_km, result.distance_km);
+	if (end_km <= start_km) {
+		return result;
+	}
+
+	vec3 sun_direction = params.sun_direction.xyz;
+	float cos_theta = dot(direction, sun_direction);
+	vec3 camera_world_km = params.camera_position.xyz * 0.001;
+	vec3 wind_offset = vec3(params.wind.x, 0.0, params.wind.y) * params.frame.x;
+	// Ambient: zenith sky radiance from above, sunlit ground (Lambertian) from below.
+	vec3 sky_ambient = textureLod(sky_view_lut, vec2(0.5, 0.0), 0.0).rgb;
+	vec3 ground_sun_transmittance = textureLod(transmittance_lut, transmittance_uv(GROUND_RADIUS_KM, sun_direction.y), 0.0).rgb;
+	vec3 ground_ambient = params.sun_illuminance.rgb * ground_sun_transmittance * max(sun_direction.y, 0.0) * GROUND_ALBEDO / PI;
+	float span_km = end_km - start_km;
+	float weighted_distance_km = 0.0;
+	float total_weight = 0.0;
+	float detail_lod_distance_km = params.cloud_quality.w;
+
+	// Samples are placed at fraction^2 along the span (quadratic spacing: short steps near the ray start,
+	// where fly-through detail matters). After two empty samples, steps grow EMPTY_STEP_SCALE times;
+	// a big step that lands in cloud backs up to just past the last empty sample and resumes fine steps.
+	const float EMPTY_STEP_SCALE = 3.0;
+	float fine_step = 1.0 / float(step_count);
+	float fraction = jitter * fine_step;
+	float previous_fraction = 0.0;
+	int empty_samples = 0;
+	// Fine steps alone finish in step_count iterations; each refinement after a big step costs one more.
+	for (int iteration = 0; iteration < step_count + 16 && fraction < 1.0; iteration++) {
+		bool skipping = empty_samples >= 2;
+		float next_fraction = min(fraction + (skipping ? fine_step * EMPTY_STEP_SCALE : fine_step), 1.0);
+		float distance_km = start_km + span_km * fraction * fraction;
+		float step_km = span_km * (next_fraction * next_fraction - fraction * fraction);
+		vec3 planet_position = camera_planet + direction * distance_km;
+		float sample_radius = length(planet_position);
+		float altitude_km = sample_radius - GROUND_RADIUS_KM;
+		float height_fraction = (altitude_km - CLOUD_BOTTOM_KM) / (CLOUD_TOP_KM - CLOUD_BOTTOM_KM);
+		vec3 world_km = camera_world_km + direction * distance_km;
+		vec3 noise_position = vec3(world_km.x, altitude_km, world_km.z) + wind_offset;
+		vec2 weather = sample_weather(noise_position.xz);
+		float base = height_fraction < 0.0 || height_fraction > 1.0 ? 0.0 : cloud_base_density(noise_position, height_fraction, weather);
+		if (base <= 0.0) {
+			empty_samples++;
+			previous_fraction = fraction;
+			fraction = next_fraction;
+			continue;
+		}
+		if (skipping) {
+			empty_samples = 0;
+			fraction = previous_fraction + fine_step;
+			continue;
+		}
+		empty_samples = 0;
+		// Detail erosion fades out toward detail_lod_distance_km and is skipped beyond it.
+		float erosion_scale = include_detail ? 1.0 - smoothstep(0.7 * detail_lod_distance_km, detail_lod_distance_km, distance_km) : 0.0;
+		float extinction = (erosion_scale > 0.0 ? erode_cloud_density(base, noise_position, height_fraction, erosion_scale) : base) * params.cloud_settings.y;
+		previous_fraction = fraction;
+		fraction = next_fraction;
+		if (extinction <= 0.0) {
+			continue;
+		}
+
+		float sun_zenith_cos = dot(planet_position / sample_radius, sun_direction);
+		float planet_shadow = ray_sphere(planet_position, sun_direction, GROUND_RADIUS_KM).x > 0.0 ? 0.0 : 1.0;
+		vec3 sun_light = params.sun_illuminance.rgb * planet_shadow * textureLod(transmittance_lut, transmittance_uv(sample_radius, sun_zenith_cos), 0.0).rgb;
+		// Deep inside an already mostly opaque ray, samples contribute little: halve the self-shadow steps.
+		int sample_light_steps = result.transmittance > 0.3 ? light_step_count : max(light_step_count / 2, 1);
+		float sun_optical_depth = optical_depth_to_sun(planet_position, noise_position, sun_direction, sample_light_steps, weather);
+		// Multiple scattering approximation (Wrenninge 2013): each octave is less attenuated,
+		// contributes less, and is less anisotropic, by the multi-scattering falloff per octave.
+		float sun_scattering = 0.0;
+		float octave_weight = 1.0;
+		for (int octave = 0; octave < 3; octave++) {
+			sun_scattering += octave_weight * exp(-sun_optical_depth * octave_weight) * cloud_phase(cos_theta, octave_weight);
+			octave_weight *= params.cloud_lighting.w;
+		}
+		vec3 ambient = (sky_ambient * mix(0.5, 1.0, height_fraction) + ground_ambient * (1.0 - height_fraction)) * params.cloud_lighting_2.x;
+		// Scattering = albedo x extinction; the rest of the extinction is absorbed.
+		vec3 in_scattering = params.cloud_lighting_2.z * extinction * (sun_light * sun_scattering + ambient);
+		float sample_transmittance = exp(-extinction * step_km);
+		// Energy-conserving analytic integration over the step (Hillaire 2015).
+		result.luminance += result.transmittance * (in_scattering - in_scattering * sample_transmittance) / extinction;
+		float absorbed = result.transmittance * (1.0 - sample_transmittance);
+		weighted_distance_km += distance_km * absorbed;
+		total_weight += absorbed;
+		result.transmittance *= sample_transmittance;
+		if (result.transmittance < 0.01) {
+			break;
+		}
+	}
+	if (total_weight > 0.0) {
+		result.distance_km = weighted_distance_km / total_weight;
+	}
+	return result;
+}

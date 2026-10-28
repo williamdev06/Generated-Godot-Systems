@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://0aa832t2fs4l"
+path="res://.godot/imported/beer_shadow_map.glsl-2c5dba110eb597ef01bb7f61510ea488.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/beer_shadow_map.glsl"
+dest_files=["res://.godot/imported/beer_shadow_map.glsl-2c5dba110eb597ef01bb7f61510ea488.res"]
+
+[params]
+

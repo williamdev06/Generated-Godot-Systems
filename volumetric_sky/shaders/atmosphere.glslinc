@@ -1,0 +1,119 @@
+// OWNS:       Earth atmosphere model: medium densities, phase functions, LUT parameterizations.
+// DEPENDS:    params.glslinc included first (sample_medium reads params.atmosphere_settings.x, haze).
+// INVARIANTS: Radii and the transmittance / sky-view / panorama mappings are duplicated in
+//             sky.gdshader (INV-1).
+// GOTCHAS:    Distances are km. Planet-centric frame: planet center at origin and the camera always at
+//             (0, R + altitude, 0) regardless of world x/z (D-2), so "up" at the camera is always +y.
+
+const float PI = 3.14159265359;
+const float GROUND_RADIUS_KM = 6360.0;
+const float TOP_RADIUS_KM = 6460.0;
+// Hillaire 2020 Earth coefficients, per km.
+const vec3 RAYLEIGH_SCATTERING = vec3(5.802e-3, 13.558e-3, 33.1e-3);
+const float RAYLEIGH_SCALE_HEIGHT_KM = 8.0;
+const float MIE_SCATTERING = 3.996e-3;
+const float MIE_EXTINCTION = 4.440e-3;
+const float MIE_SCALE_HEIGHT_KM = 1.2;
+const float MIE_ANISOTROPY = 0.8;
+const vec3 OZONE_ABSORPTION = vec3(0.650e-3, 1.881e-3, 0.085e-3);
+#define GROUND_ALBEDO params.ground_albedo.rgb
+const float AERIAL_PERSPECTIVE_MAX_KM = 100.0;
+
+struct Medium {
+	vec3 rayleigh_scattering;
+	float mie_scattering;
+	vec3 scattering;
+	vec3 extinction;
+};
+
+Medium sample_medium(float altitude_km) {
+	float altitude = max(altitude_km, 0.0);
+	float rayleigh_density = exp(-altitude / RAYLEIGH_SCALE_HEIGHT_KM);
+	float mie_density = exp(-altitude / MIE_SCALE_HEIGHT_KM) * params.atmosphere_settings.x;
+	// Ozone: tent profile peaking at 25 km.
+	float ozone_density = max(0.0, 1.0 - abs(altitude - 25.0) / 15.0);
+	Medium medium;
+	medium.rayleigh_scattering = RAYLEIGH_SCATTERING * rayleigh_density;
+	medium.mie_scattering = MIE_SCATTERING * mie_density;
+	medium.scattering = medium.rayleigh_scattering + medium.mie_scattering;
+	medium.extinction = medium.rayleigh_scattering + MIE_EXTINCTION * mie_density + OZONE_ABSORPTION * ozone_density;
+	return medium;
+}
+
+// Distances to the near and far intersections; both negative on a miss. `direction` must be normalized.
+vec2 ray_sphere(vec3 origin, vec3 direction, float radius) {
+	float b = dot(origin, direction);
+	float c = dot(origin, origin) - radius * radius;
+	float discriminant = b * b - c;
+	if (discriminant < 0.0) {
+		return vec2(-1.0);
+	}
+	float root = sqrt(discriminant);
+	return vec2(-b - root, -b + root);
+}
+
+float rayleigh_phase(float cos_theta) {
+	return 3.0 / (16.0 * PI) * (1.0 + cos_theta * cos_theta);
+}
+
+float henyey_greenstein(float cos_theta, float anisotropy) {
+	float anisotropy_squared = anisotropy * anisotropy;
+	return (1.0 - anisotropy_squared) / (4.0 * PI * pow(1.0 + anisotropy_squared - 2.0 * anisotropy * cos_theta, 1.5));
+}
+
+// Transmittance LUT (Bruneton 2017): x = distance to the atmosphere top, y = height, both non-linear.
+vec2 transmittance_uv(float view_height, float view_zenith_cos) {
+	float horizon = sqrt(TOP_RADIUS_KM * TOP_RADIUS_KM - GROUND_RADIUS_KM * GROUND_RADIUS_KM);
+	float rho = sqrt(max(view_height * view_height - GROUND_RADIUS_KM * GROUND_RADIUS_KM, 0.0));
+	float discriminant = view_height * view_height * (view_zenith_cos * view_zenith_cos - 1.0) + TOP_RADIUS_KM * TOP_RADIUS_KM;
+	float distance_to_top = max(-view_height * view_zenith_cos + sqrt(max(discriminant, 0.0)), 0.0);
+	float min_distance = TOP_RADIUS_KM - view_height;
+	float max_distance = rho + horizon;
+	return vec2((distance_to_top - min_distance) / (max_distance - min_distance), rho / horizon);
+}
+
+void transmittance_uv_to_params(vec2 uv, out float view_height, out float view_zenith_cos) {
+	float horizon = sqrt(TOP_RADIUS_KM * TOP_RADIUS_KM - GROUND_RADIUS_KM * GROUND_RADIUS_KM);
+	float rho = horizon * uv.y;
+	view_height = sqrt(rho * rho + GROUND_RADIUS_KM * GROUND_RADIUS_KM);
+	float min_distance = TOP_RADIUS_KM - view_height;
+	float max_distance = rho + horizon;
+	float distance_to_top = min_distance + uv.x * (max_distance - min_distance);
+	view_zenith_cos = distance_to_top == 0.0 ? 1.0 : (horizon * horizon - rho * rho - distance_to_top * distance_to_top) / (2.0 * view_height * distance_to_top);
+	view_zenith_cos = clamp(view_zenith_cos, -1.0, 1.0);
+}
+
+vec2 multi_scatter_uv(float view_height, float sun_zenith_cos) {
+	return clamp(vec2(sun_zenith_cos * 0.5 + 0.5, (view_height - GROUND_RADIUS_KM) / (TOP_RADIUS_KM - GROUND_RADIUS_KM)), 0.0, 1.0);
+}
+
+// Sky-view LUT (Hillaire 2020): x = world azimuth, y = zenith angle squeezed toward the horizon.
+// The upper half of y covers sky above the horizon, the lower half covers below it.
+vec3 sky_view_uv_to_direction(vec2 uv, float view_height) {
+	float horizon_distance = sqrt(max(view_height * view_height - GROUND_RADIUS_KM * GROUND_RADIUS_KM, 0.0));
+	float beta = acos(horizon_distance / view_height);
+	float zenith_horizon_angle = PI - beta;
+	float view_zenith_angle;
+	if (uv.y < 0.5) {
+		float coord = 1.0 - 2.0 * uv.y;
+		view_zenith_angle = zenith_horizon_angle * (1.0 - coord * coord);
+	} else {
+		float coord = uv.y * 2.0 - 1.0;
+		view_zenith_angle = zenith_horizon_angle + beta * coord * coord;
+	}
+	float azimuth = (uv.x - 0.5) * 2.0 * PI;
+	float sin_zenith = sin(view_zenith_angle);
+	return vec3(sin_zenith * cos(azimuth), cos(view_zenith_angle), sin_zenith * sin(azimuth));
+}
+
+// Aerial perspective volume: screen-aligned, texel z holds the froxel center at
+// ((z + 0.5) / slices)^2 * max distance. Returns rgb in-scattering and a = mean transmittance.
+// Slice count comes from the texture: it's the shaft_depth_slices setting.
+vec4 sample_aerial_perspective(sampler3D volume, vec2 uv, float distance_km) {
+	float slice_count = float(textureSize(volume, 0).z);
+	float slice = sqrt(distance_km / AERIAL_PERSPECTIVE_MAX_KM);
+	// Fade toward "no atmosphere" in front of the first froxel center.
+	float weight = clamp(slice * slice_count * 2.0, 0.0, 1.0);
+	vec4 aerial_perspective = textureLod(volume, vec3(uv, slice), 0.0);
+	return vec4(aerial_perspective.rgb * weight, mix(1.0, aerial_perspective.a, weight));
+}

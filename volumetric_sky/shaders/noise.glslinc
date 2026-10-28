@@ -1,0 +1,68 @@
+// OWNS:       Tileable hash, Worley and gradient (Perlin) noise functions over [0, 1)^3.
+// DEPENDS:    Nothing.
+// INVARIANTS: All noise tiles with period 1 in each axis when `frequency` is a whole number.
+// GOTCHAS:    Only for one-time generation passes: Worley costs 27 cell lookups per octave.
+
+// Dave Hoskins, "Hash without Sine".
+vec3 hash33(vec3 position) {
+	position = fract(position * vec3(0.1031, 0.1030, 0.0973));
+	position += dot(position, position.yxz + 33.33);
+	return fract((position.xxy + position.yxx) * position.zyx);
+}
+
+// Wrapping the cell by `frequency` makes the noise tile.
+vec3 cell_hash(vec3 cell, float frequency) {
+	return hash33(mod(cell, frequency) + 17.0);
+}
+
+float worley(vec3 position, float frequency) {
+	vec3 scaled = position * frequency;
+	vec3 cell = floor(scaled);
+	vec3 local_position = fract(scaled);
+	float nearest = 1.0;
+	for (int x = -1; x <= 1; x++) {
+		for (int y = -1; y <= 1; y++) {
+			for (int z = -1; z <= 1; z++) {
+				vec3 offset = vec3(x, y, z);
+				vec3 feature = offset + cell_hash(cell + offset, frequency);
+				nearest = min(nearest, length(local_position - feature));
+			}
+		}
+	}
+	return 1.0 - nearest;
+}
+
+float worley_fbm(vec3 position, float frequency) {
+	return worley(position, frequency) * 0.625 + worley(position, frequency * 2.0) * 0.25 + worley(position, frequency * 4.0) * 0.125;
+}
+
+float gradient_corner(vec3 cell, vec3 offset, vec3 local_position, float frequency) {
+	vec3 gradient = cell_hash(cell + offset, frequency) * 2.0 - 1.0;
+	return dot(gradient, local_position - offset);
+}
+
+float gradient_noise(vec3 position, float frequency) {
+	vec3 scaled = position * frequency;
+	vec3 cell = floor(scaled);
+	vec3 local_position = fract(scaled);
+	vec3 fade = local_position * local_position * local_position * (local_position * (local_position * 6.0 - 15.0) + 10.0);
+	float x00 = mix(gradient_corner(cell, vec3(0, 0, 0), local_position, frequency), gradient_corner(cell, vec3(1, 0, 0), local_position, frequency), fade.x);
+	float x10 = mix(gradient_corner(cell, vec3(0, 1, 0), local_position, frequency), gradient_corner(cell, vec3(1, 1, 0), local_position, frequency), fade.x);
+	float x01 = mix(gradient_corner(cell, vec3(0, 0, 1), local_position, frequency), gradient_corner(cell, vec3(1, 0, 1), local_position, frequency), fade.x);
+	float x11 = mix(gradient_corner(cell, vec3(0, 1, 1), local_position, frequency), gradient_corner(cell, vec3(1, 1, 1), local_position, frequency), fade.x);
+	return mix(mix(x00, x10, fade.y), mix(x01, x11, fade.y), fade.z);
+}
+
+float perlin_fbm(vec3 position, float frequency) {
+	float value = 0.0;
+	float amplitude = 1.0;
+	float total_amplitude = 0.0;
+	for (int octave = 0; octave < 4; octave++) {
+		value += gradient_noise(position, frequency) * amplitude;
+		total_amplitude += amplitude;
+		amplitude *= 0.5;
+		frequency *= 2.0;
+	}
+	return value / total_amplitude;
+}
+

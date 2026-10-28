@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://p3a5w0vlr8vg"
+path="res://.godot/imported/cloud_panorama.glsl-e82e19009684f1c85c1b4c722cc7bd31.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/cloud_panorama.glsl"
+dest_files=["res://.godot/imported/cloud_panorama.glsl-e82e19009684f1c85c1b4c722cc7bd31.res"]
+
+[params]
+

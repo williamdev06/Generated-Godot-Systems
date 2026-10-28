@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cu2ea68qw3gha"
+path="res://.godot/imported/cloud_shadow_map.glsl-554edb6f137da64ed9331daac8608712.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/cloud_shadow_map.glsl"
+dest_files=["res://.godot/imported/cloud_shadow_map.glsl-554edb6f137da64ed9331daac8608712.res"]
+
+[params]
+

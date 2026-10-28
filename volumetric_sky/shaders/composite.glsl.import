@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://djauhtf5pve1w"
+path="res://.godot/imported/composite.glsl-3ed4bd746c645bfd4e26eb96b0cffb6e.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/composite.glsl"
+dest_files=["res://.godot/imported/composite.glsl-3ed4bd746c645bfd4e26eb96b0cffb6e.res"]
+
+[params]
+

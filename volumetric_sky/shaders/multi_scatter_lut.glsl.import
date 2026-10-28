@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://4rixcpgd4rfy"
+path="res://.godot/imported/multi_scatter_lut.glsl-3fc46bc4ee59423086fa3553abd1d282.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/multi_scatter_lut.glsl"
+dest_files=["res://.godot/imported/multi_scatter_lut.glsl-3fc46bc4ee59423086fa3553abd1d282.res"]
+
+[params]
+

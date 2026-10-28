@@ -1,0 +1,114 @@
+[gd_scene format=3 uid="uid://bgmhq0nokexj1"]
+
+[ext_resource type="Script" uid="uid://grje0a2chwph" path="res://volumetric_sky/volumetric_sky_effect.gd" id="1_effect"]
+[ext_resource type="Script" uid="uid://dkfr01dp7lqhi" path="res://volumetric_sky/volumetric_sky.gd" id="2_sky"]
+[ext_resource type="Shader" uid="uid://ceq8mjrq623a7" path="res://volumetric_sky/sky.gdshader" id="3_shader"]
+[ext_resource type="Shader" uid="uid://b5mxrcvocwnoy" path="res://volumetric_sky/demo/ground.gdshader" id="4_ground"]
+
+[sub_resource type="Texture2DRD" id="Texture2DRD_xscfv"]
+
+[sub_resource type="Texture2DRD" id="Texture2DRD_y80xr"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_sky"]
+shader = ExtResource("3_shader")
+shader_parameter/sky_view_lut = SubResource("Texture2DRD_y80xr")
+shader_parameter/cloud_panorama = SubResource("Texture2DRD_xscfv")
+shader_parameter/camera_altitude_km = 1.1982540283203125
+shader_parameter/refresh_index = 31440.0
+shader_parameter/sun_disc_brightness = 30.0
+
+[sub_resource type="Sky" id="Sky_main"]
+sky_material = SubResource("ShaderMaterial_sky")
+process_mode = 3
+
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 2
+sky = SubResource("Sky_main")
+tonemap_mode = 4
+tonemap_exposure = 1.4
+glow_enabled = true
+glow_levels/1 = 0.42
+glow_levels/2 = 0.57
+glow_levels/3 = 0.62
+glow_levels/4 = 0.3
+glow_levels/5 = 0.3
+glow_levels/6 = 0.1
+glow_levels/7 = 0.1
+glow_intensity = 1.0
+
+[sub_resource type="CompositorEffect" id="CompositorEffect_sky"]
+resource_local_to_scene = false
+resource_name = ""
+enabled = true
+effect_callback_type = 3
+access_resolved_color = false
+access_resolved_depth = false
+needs_motion_vectors = false
+needs_normal_roughness = false
+script = ExtResource("1_effect")
+density = 10.0
+shape_noise_scale_km = 8.7
+detail_noise_scale_km = 0.6000000000000001
+weather_noise_scale_km = 25.0
+self_shadow_distance_km = 6.0
+cloud_checkerboard = false
+cloud_steps = 32
+cloud_max_distance_km = 60.0
+ground_albedo = Color(0.07, 0.07, 0.07, 1)
+shaft_intensity = 10.0
+shaft_distance_km = 32.0
+shaft_depth_slices = 64
+cloud_ao_map_size_km = 32.0
+
+[sub_resource type="Compositor" id="Compositor_main"]
+compositor_effects = Array[CompositorEffect]([SubResource("CompositorEffect_sky")])
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_ground"]
+size = Vector2(20000, 20000)
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_ground"]
+render_priority = 0
+shader = ExtResource("4_ground")
+shader_parameter/albedo = Color(0.25, 0.3, 0.2, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_tower"]
+size = Vector3(200, 5762.911, 200)
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_lrufl"]
+render_priority = 0
+shader = ExtResource("4_ground")
+shader_parameter/albedo = Color(0.49929494, 1.920417e-05, 0.37987557, 1)
+
+[node name="Demo" type="Node3D" unique_id=438631619]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=2092210566]
+environment = SubResource("Environment_main")
+compositor = SubResource("Compositor_main")
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=1069946303]
+transform = Transform3D(0.9244477, -0.36611205, -0.106575474, 0.38130876, 0.88760465, 0.25838214, 8.2544915e-08, -0.2794989, 0.9601458, 0, 0, 0)
+light_color = Color(0.8242241, 0.6289929, 0.41735852, 1)
+light_angular_distance = 1.98
+shadow_enabled = true
+directional_shadow_split_1 = 0.01
+directional_shadow_split_2 = 0.1
+directional_shadow_split_3 = 0.3
+directional_shadow_max_distance = 1000.0
+
+[node name="VolumetricSky" type="Node" parent="." unique_id=678727421 node_paths=PackedStringArray("sun", "world_environment")]
+script = ExtResource("2_sky")
+sun = NodePath("../Sun")
+world_environment = NodePath("../WorldEnvironment")
+
+[node name="Ground" type="MeshInstance3D" parent="." unique_id=702354748]
+mesh = SubResource("PlaneMesh_ground")
+surface_material_override/0 = SubResource("ShaderMaterial_ground")
+
+[node name="TowerIntoClouds" type="MeshInstance3D" parent="." unique_id=318066641]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2881.4556, 5775.5693)
+mesh = SubResource("BoxMesh_tower")
+surface_material_override/0 = SubResource("ShaderMaterial_lrufl")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1559949156]
+transform = Transform3D(1, 0, 0, 0, 0.9848077, -0.17364818, 0, 0.17364818, 0.9848077, 0, 2, 0)
+far = 50000.0

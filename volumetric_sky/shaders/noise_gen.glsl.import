@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://u2qud2ndrtp"
+path="res://.godot/imported/noise_gen.glsl-8484e79d6b14261f7b72b47a6c117601.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/noise_gen.glsl"
+dest_files=["res://.godot/imported/noise_gen.glsl-8484e79d6b14261f7b72b47a6c117601.res"]
+
+[params]
+

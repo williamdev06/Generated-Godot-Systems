@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cc2k4b1i1p8bv"
+path="res://.godot/imported/clouds_temporal.glsl-3877864e1be2b3a9efbf6a8b0034b8d1.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/clouds_temporal.glsl"
+dest_files=["res://.godot/imported/clouds_temporal.glsl-3877864e1be2b3a9efbf6a8b0034b8d1.res"]
+
+[params]
+

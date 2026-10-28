@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://14nhr2ye7w3v"
+path="res://.godot/imported/weather_gen.glsl-84e022ff07011df3845caf90ec3a5d2a.res"
+
+[deps]
+
+source_file="res://volumetric_sky/shaders/weather_gen.glsl"
+dest_files=["res://.godot/imported/weather_gen.glsl-84e022ff07011df3845caf90ec3a5d2a.res"]
+
+[params]
+
