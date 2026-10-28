@@ -1,7 +1,7 @@
 @tool
 class_name MarchingCubes
 extends RefCounted
-# OWNS:       Turning a padded density/type grid into one chunk mesh with Marching Cubes.
+# OWNS:       Turning a padded density/type grid into one chunk's mesh arrays with Marching Cubes.
 # DEPENDS:    VoxelChunk (SIZE, ISO)
 # INVARIANTS: Input grids hold PADDED^3 samples covering chunk-local -1..SIZE+1 per axis (INV-7).
 #             CORNERS and EDGES must keep the numbering TRIANGLES was written for.
@@ -299,7 +299,9 @@ const TRIANGLES := [
 # Returns null when the chunk has no surface. Every vertex carries its triangle's three voxel types
 # (CUSTOM0 rgb, in triangle corner order) and its barycentric weight for them (COLOR), which
 # voxel_terrain.gdshader blends by (D-23).
-static func build_mesh(densities: PackedByteArray, types: PackedByteArray) -> ArrayMesh:
+# Mesh.ARRAY_MAX surface arrays, or [] when the chunk has no surface. Arrays rather than an ArrayMesh
+# so the caller can also build collision from them: reading an ArrayMesh back is a GPU readback.
+static func build_arrays(densities: PackedByteArray, types: PackedByteArray) -> Array:
 	var vertices := PackedVector3Array()
 	var normals := PackedVector3Array()
 	var weights := PackedColorArray()
@@ -359,7 +361,7 @@ static func build_mesh(densities: PackedByteArray, types: PackedByteArray) -> Ar
 						corner_types.append(0)
 				cell_index += 1
 	if vertices.is_empty():
-		return null
+		return []
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
@@ -367,6 +369,11 @@ static func build_mesh(densities: PackedByteArray, types: PackedByteArray) -> Ar
 	arrays[Mesh.ARRAY_COLOR] = weights
 	arrays[Mesh.ARRAY_CUSTOM0] = corner_types
 	arrays[Mesh.ARRAY_INDEX] = indices
+	return arrays
+
+
+# The ArrayMesh for non-empty build_arrays output.
+static func create_mesh(arrays: Array) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], {},
 		Mesh.ARRAY_CUSTOM_RGBA8_UNORM << Mesh.ARRAY_FORMAT_CUSTOM0_SHIFT)

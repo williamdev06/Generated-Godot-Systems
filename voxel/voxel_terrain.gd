@@ -2,9 +2,9 @@
 class_name VoxelTerrain
 extends Node3D
 # OWNS:       The 3D chunk grid, infinite (streamed around the camera) or contained: threaded
-#             generation and meshing, edits.
+#             generation and meshing, trimesh collision, edits, density field queries.
 # DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, VoxelType, VoxelStorage (VoxelRegionStorage,
-#             VoxelModel), voxel_terrain.gdshader, WorkerThreadPool
+#             VoxelModel), voxel_terrain.gdshader, WorkerThreadPool, physics (StaticBody3D)
 # INVARIANTS: Every chunk not loaded from storage is in _unsaved until written; saved chunks override
 #             the generator. A chunk is never in both _chunks and _save_queue (D-25, D-26).
 # GOTCHAS:    @tool: everything is rebuilt in the editor when any export, the generator or its noise
@@ -29,6 +29,17 @@ extends Node3D
 #             wanted again before its save finished is taken back from the queue, never reloaded
 #             stale. Contained edits reach model every frame, so duplicating it (Make Unique) or
 #             saving it as an asset captures them.
+#             Collision (D-28): each chunk MeshInstance3D has exactly one child chain,
+#             StaticBody3D > CollisionShape3D (ConcavePolygonShape3D of the mesh triangles),
+#             built in the editor too. The shape is created on the main thread (physics server
+#             calls are not thread-safe without physics/3d/run_on_separate_thread); faces on the
+#             worker. Density field queries (sample_density, get_normal, raycast, push_out) are
+#             terrain-local like set_voxel and main thread only. Unlike get_density they also read
+#             chunks that are not loaded, loading or generating them synchronously (one chunk is
+#             thousands of noise samples); in infinite worlds those stay until the next _refresh
+#             unloads them. Before the first (deferred) rebuild they see no storage or model, so
+#             spawn queries from _ready must be deferred. Trilinear density matches the mesh along
+#             cell edges only.
 
 @export var generator: VoxelGenerator:
 	set(value):
@@ -81,6 +92,14 @@ extends Node3D
 			storage.changed.connect(_queue_rebuild)
 		_queue_rebuild()
 
+# Physics layers of the chunk trimesh bodies.
+@export_flags_3d_physics var collision_layer := 1:
+	set(value):
+		collision_layer = value
+		for mesh_instance in _meshes.values():
+			if mesh_instance != null:
+				(mesh_instance.get_child(0) as StaticBody3D).collision_layer = value
+
 # Contained only: the world (size, types, chunks). Left empty, a model built into the scene is
 # created; save that as a file to reuse the terrain, or assign a model asset.
 @export var model: VoxelModel:
@@ -91,6 +110,9 @@ extends Node3D
 		if model != null:
 			model.changed.connect(_queue_rebuild)
 		_queue_rebuild()
+
+# sample_density above this is solid.
+const ISO_DENSITY := VoxelChunk.ISO / 255.0
 
 var _chunks: Dictionary[Vector3i, VoxelChunk] = {}
 # A null value marks a chunk that was meshed but has no surface.
@@ -235,6 +257,72 @@ func get_type(world: Vector3i) -> int:
 	if chunk == null or chunk.types.is_empty():
 		return 0
 	return chunk.types[VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)]
+
+
+# Trilinear density (0.0..1.0) at a terrain-local point; solid above ISO_DENSITY.
+func sample_density(point: Vector3) -> float:
+	var base := Vector3i(point.floor())
+	var fraction := point - Vector3(base)
+	var density := 0.0
+	for corner: Vector3i in MarchingCubes.CORNERS:
+		var weights := Vector3(
+			fraction.x if corner.x == 1 else 1.0 - fraction.x,
+			fraction.y if corner.y == 1 else 1.0 - fraction.y,
+			fraction.z if corner.z == 1 else 1.0 - fraction.z,
+		)
+		density += _sample(base + corner) * weights.x * weights.y * weights.z
+	return density
+
+
+# Outward unit normal (negative density gradient) at a terrain-local point. Zero where the field is
+# flat: more than VoxelChunk.BAND from the surface, or inside uniformly authored solid.
+func get_normal(point: Vector3) -> Vector3:
+	var gradient := Vector3(
+		sample_density(point + Vector3.RIGHT * 0.5) - sample_density(point + Vector3.LEFT * 0.5),
+		sample_density(point + Vector3.UP * 0.5) - sample_density(point + Vector3.DOWN * 0.5),
+		sample_density(point + Vector3.BACK * 0.5) - sample_density(point + Vector3.FORWARD * 0.5),
+	)
+	return -gradient.normalized()
+
+
+# First surface crossing on the terrain-local segment from -> to as {position, normal}, position on
+# the air side; {} if the segment stays in air. Starting inside solid hits at from.
+func raycast(from: Vector3, to: Vector3) -> Dictionary:
+	if sample_density(from) > ISO_DENSITY:
+		return {"position": from, "normal": get_normal(from)}
+	# Quarter-unit steps: whole-unit steps skip the thin solid where a ray clips a cell corner.
+	var step_count := ceili(from.distance_to(to) * 4.0)
+	var previous := from
+	for step in range(1, step_count + 1):
+		var current := from.lerp(to, float(step) / step_count)
+		if sample_density(current) > ISO_DENSITY:
+			var hit := _bisect(previous, current)
+			return {"position": hit, "normal": get_normal(hit)}
+		previous = current
+	return {}
+
+
+# Nearest air to a terrain-local point, for unstucking: the surface crossing toward the closest air
+# sample within REACH, on the air side. Returns point unchanged if it is already in air or no air
+# is that close. Searches samples rather than following the gradient, which is zero deep in solid.
+func push_out(point: Vector3) -> Vector3:
+	const REACH := 8
+	if sample_density(point) <= ISO_DENSITY:
+		return point
+	var center := Vector3i(point.round())
+	var nearest_air := point
+	var nearest_distance := INF
+	for z in range(-REACH, REACH + 1):
+		for y in range(-REACH, REACH + 1):
+			for x in range(-REACH, REACH + 1):
+				var sample := center + Vector3i(x, y, z)
+				var distance := point.distance_squared_to(Vector3(sample))
+				if distance < nearest_distance and _sample(sample) <= ISO_DENSITY:
+					nearest_air = Vector3(sample)
+					nearest_distance = distance
+	if nearest_distance == INF:
+		return point
+	return _bisect(nearest_air, point)
 
 
 func _queue_rebuild() -> void:
@@ -486,12 +574,24 @@ func _mesh_chunk(task: ChunkTask, chunk_densities: Array[PackedByteArray],
 				padded_index += 1
 	if task.cancelled:
 		return
+	var arrays := MarchingCubes.build_arrays(densities, types)
+	# No surface leaves result null.
+	if arrays.is_empty():
+		return
+	# ConcavePolygonShape3D takes one vertex per triangle corner, not indexed vertices.
+	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+	var faces := PackedVector3Array()
+	faces.resize(indices.size())
+	for index in indices.size():
+		faces[index] = vertices[indices[index]]
 	# Building the ArrayMesh here is safe: resources may be created off the main thread.
-	task.result = MarchingCubes.build_mesh(densities, types)
+	task.result = [MarchingCubes.create_mesh(arrays), faces]
 
 
-func _apply_mesh(coord: Vector3i, mesh: ArrayMesh) -> void:
-	if mesh == null:
+# result is null for a chunk without surface, else [ArrayMesh, collision faces].
+func _apply_mesh(coord: Vector3i, result: Variant) -> void:
+	if result == null:
 		if _meshes.get(coord) != null:
 			_meshes[coord].queue_free()
 		_meshes[coord] = null
@@ -500,9 +600,16 @@ func _apply_mesh(coord: Vector3i, mesh: ArrayMesh) -> void:
 		var mesh_instance := MeshInstance3D.new()
 		mesh_instance.position = Vector3(coord * VoxelChunk.SIZE)
 		mesh_instance.material_override = _material
+		var body := StaticBody3D.new()
+		body.collision_layer = collision_layer
+		body.add_child(CollisionShape3D.new())
+		mesh_instance.add_child(body)
 		add_child(mesh_instance, false, Node.INTERNAL_MODE_BACK)
 		_meshes[coord] = mesh_instance
-	_meshes[coord].mesh = mesh
+	_meshes[coord].mesh = result[0]
+	var shape := ConcavePolygonShape3D.new()
+	shape.set_faces(result[1])
+	(_meshes[coord].get_child(0).get_child(0) as CollisionShape3D).shape = shape
 
 
 # True when every chunk is entirely density: no ISO crossing, so no surface. A clamped gather
@@ -583,8 +690,33 @@ func _get_chunk(coord: Vector3i) -> VoxelChunk:
 			chunk = generator.generate(coord)
 		else:
 			chunk = VoxelChunk.new()
+		# Not from storage, so it must be written (class INVARIANTS), as in _finish_tasks.
+		_unsaved[coord] = false
 	_chunks[coord] = chunk
 	return chunk
+
+
+# 0.0..1.0 density of one sample, loading or generating its chunk if needed; air outside a
+# contained world.
+func _sample(world: Vector3i) -> float:
+	var coord := _chunk_coord(world)
+	if _is_outside_world(coord):
+		return 0.0
+	var chunk := _get_chunk(coord)
+	if chunk.densities.is_empty():
+		return 0.0
+	return chunk.densities[VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)] / 255.0
+
+
+# Air side of the surface between an air point and a solid point, to 1/256 of their distance.
+func _bisect(air: Vector3, solid: Vector3) -> Vector3:
+	for iteration in 8:
+		var middle := air.lerp(solid, 0.5)
+		if sample_density(middle) > ISO_DENSITY:
+			solid = middle
+		else:
+			air = middle
+	return air
 
 
 # An unloaded chunk whose save has not finished is taken back, not reloaded stale from storage.

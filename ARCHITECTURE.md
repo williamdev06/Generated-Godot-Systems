@@ -19,10 +19,10 @@ Target: Windows, D3D12
 | M-4 | volumetric_sky/shaders/ | Compute passes: LUTs, noise, clouds, composite | M-1 dispatch | active |
 | M-5 | volumetric_sky/demo/ | Reference scene wiring M-1..M-3, M-6 | M-1, M-2, M-3, M-6 | active |
 | M-6 | volumetric_sky/cloud_shadow.gdshaderinc | Cloud shadow, cloud AO, drop-in light() for materials | shader globals from M-1, M-2 | active |
-| M-7 | voxel/voxel_terrain.gd | Streamed or contained chunk grid, threaded meshing, edits | M-8, M-9, M-10, M-13, M-14, M-15, M-16 | active |
+| M-7 | voxel/voxel_terrain.gd | Chunk grid, threaded meshing, collision, edits, density queries | M-8, M-9, M-10, M-13, M-14, M-15, M-16, physics | active |
 | M-8 | voxel/voxel_chunk.gd | Per-chunk byte samples and their saved encoding | none | active |
 | M-9 | voxel/voxel_generator.gd | Procedural chunk density and type | M-8, FastNoiseLite | active |
-| M-10 | voxel/marching_cubes.gd | Padded density grid to chunk ArrayMesh | M-8 | active |
+| M-10 | voxel/marching_cubes.gd | Padded density grid to chunk mesh arrays | M-8 | active |
 | M-11 | voxel/demo/ | Reference scene for M-7 with M-9 | M-7, M-9, M-13 | active |
 | M-12 | addons/voxel_editor/ | Editor sculpt and voxel tools for M-7 | M-7, M-8, EditorPlugin | active |
 | M-13 | voxel/voxel_type.gd | Per voxel type texture (Resource) | none | active |
@@ -53,8 +53,10 @@ M-16 -> M-7: VoxelModel.changed (world_size or voxel_types set) -> full rebuild;
 M-10 -> M-14: per vertex CUSTOM0 rgb = triangle corner types, COLOR rgb = barycentric weights
 M-15 (infinite) / M-16 (contained) -> M-7: load_chunk(coord) -> VoxelChunk or null, on the generation worker before generating
 M-7 -> M-15 / M-16: save_chunk(coord, densities, types); unloaded chunks on one save task, all unsaved on editor scene save (and deletion, infinite only), edited ones on rebuild and (contained) every frame with edits; M-7 then ResourceSaver.save(model) if it is an asset file
-M-7 -> M-10: MarchingCubes.build_mesh(padded densities, padded types) -> ArrayMesh or null on a worker thread; per chunk once its 26 neighbours have data and are not uniformly 0 or 255, on rebuild and after set_voxel
+M-7 -> M-10: MarchingCubes.build_arrays(padded densities, padded types) -> surface arrays or [], then create_mesh(arrays) -> ArrayMesh, on a worker thread; per chunk once its 26 neighbours have data and are not uniformly 0 or 255, on rebuild and after set_voxel
 M-12 -> M-7: get_density (0..1)/get_type reads (missing or empty chunks read as air), set_voxel writes; on left click/drag in the 3D viewport with a tool active
+M-7 -> physics: per-chunk StaticBody3D (collision_layer) + ConcavePolygonShape3D of the mesh triangles (faces unrolled on the worker); replaced with the mesh in _apply_mesh
+callers -> M-7: sample_density / get_normal / raycast / push_out (terrain-local, main thread); load or generate missing chunks synchronously
 EditorUndoRedoManager -> M-7: set_voxels(worlds, densities, types) with a stroke's before/after values; on undo/redo
 
 ## INVARIANTS
@@ -96,6 +98,7 @@ D-24 2026-10-28: Editor tools have no separate subtract variants: Sculpt, Voxel 
 D-25 2026-10-28: Infinite worlds persist every generated or edited chunk through a VoxelRegionStorage (only storage type, so no base class yet) instead of authored_chunks; contained worlds keep authored_chunks in the scene. No storage directory: configuration warning plus a push_warning at save points, nothing saved. Region files hold 8^3 chunks (4 KB offset/length header, zstd payloads, append on growth; growth and storage base class SUPERSEDED BY D-26). Saved chunks win over the generator, so generator changes only affect chunks never saved; rebuild keeps only edits.
 D-26 2026-10-28: Contained worlds save every chunk into a VoxelModel resource: built into the scene when none is assigned (auto-created, so the inspector's Save As / Make Unique turn it into an asset or back), or a shared asset written on editor scene save. Model and region files store the same VoxelChunk.encode payloads (INV-9) behind a VoxelStorage base class; contained edits reach the model every frame so duplicates capture them; closing without saving discards contained changes. Region writes use the first gap that fits and truncate the tail, so files no longer only grow.
 D-27 2026-10-28: A VoxelModel owns its contained world's world_size and voxel_types (moved off VoxelTerrain for contained worlds) so a reused model asset brings its size and palette; VoxelTerrain.voxel_types now applies to infinite worlds only and callers use get_voxel_types().
+D-28 2026-10-28: Two collision paths. Trimesh per chunk (exact match to the mesh) for physics bodies and visuals; density field queries (trilinear, no physics) for characters, items, unstuck and spawn, since they work before meshing and can push out of solid. Faces come from MarchingCubes arrays, not the ArrayMesh (GPU readback). Editor picking stays on D-21.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).
