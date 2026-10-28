@@ -3,24 +3,21 @@ class_name VoxelChunk
 extends Resource
 # OWNS:       Density and voxel type samples of one chunk (SIZE^3, one sample per world unit).
 # DEPENDS:    nothing
-# INVARIANTS: densities and types both hold SIZE^3 entries laid out by sample_index (see INV-7).
-#             density > 0 is solid, <= 0 is air; the surface is the 0 crossing.
+# INVARIANTS: densities and types are both empty (all air) or both hold VOLUME entries laid out by
+#             sample_index (see INV-7). Density byte 0..255 is 0.0..1.0; above ISO (0.5) is solid,
+#             0 is empty; the surface is the ISO crossing (D-21). A type is an index into
+#             VoxelTerrain.voxel_types.
 # GOTCHAS:    @tool because VoxelTerrain creates chunks in the editor. A chunk owns samples
 #             0..SIZE-1 per axis only; meshing reads one sample past them on each side (INV-7), so
 #             edits near a chunk border change neighbour meshes too.
 
-enum Type { DIRT, GRASS, STONE }
-
 const SIZE := 16
+const VOLUME := SIZE * SIZE * SIZE
+# Between two byte values, so the surface never passes exactly through a sample.
+const ISO := 127.5
 
-@export_storage var densities := PackedFloat32Array()
+@export_storage var densities := PackedByteArray()
 @export_storage var types := PackedByteArray()
-
-
-func _init() -> void:
-	densities.resize(SIZE * SIZE * SIZE)
-	densities.fill(-1.0)
-	types.resize(SIZE * SIZE * SIZE)
 
 
 static func sample_index(local: Vector3i) -> int:

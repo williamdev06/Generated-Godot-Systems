@@ -3,9 +3,10 @@ class_name VoxelTerrain
 extends Node3D
 # OWNS:       The 3D chunk grid, infinite (streamed around the camera) or contained: threaded
 #             generation and meshing, edits.
-# DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, WorkerThreadPool
+# DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, VoxelType, voxel_terrain.gdshader,
+#             WorkerThreadPool
 # INVARIANTS: An authored chunk is the same object in authored_chunks and _chunks, so edits land in
-#             the saved data; authored chunks override the generator (see D-17).
+#             the saved data; authored chunks override the generator (see D-17, D-21).
 # GOTCHAS:    @tool: everything is rebuilt in the editor when any export, the generator or its noise
 #             change. Chunk MeshInstance3Ds are internal children without an owner, so they are
 #             never saved into the scene. Without a generator, unauthored chunks are air. A chunk
@@ -21,6 +22,7 @@ extends Node3D
 #             Tasks call methods on this node, so PREDELETE waits for them. Results are applied in
 #             _process, which also runs in the editor. Cancelling only sets a flag the worker checks
 #             between stages; the task still has to be waited for (_abandoned_tasks).
+#             Chunks whose 3x3x3 neighbourhood is uniformly air or uniformly full get no mesh task.
 
 @export var generator: VoxelGenerator:
 	set(value):
@@ -62,6 +64,19 @@ extends Node3D
 		outside_faces = value
 		_queue_rebuild()
 
+# A chunk's type byte indexes this; the shader texture layer of each type. Changing it never remeshes.
+@export var voxel_types: Array[VoxelType] = []:
+	set(value):
+		for voxel_type in voxel_types:
+			if voxel_type != null:
+				voxel_type.changed.disconnect(_update_textures)
+		voxel_types = value
+		for voxel_type in voxel_types:
+			if voxel_type != null:
+				# Reference counted: the same type may be listed twice.
+				voxel_type.changed.connect(_update_textures, CONNECT_REFERENCE_COUNTED)
+		_update_textures()
+
 # Chunks changed through set_voxel, saved with the scene.
 @export_storage var authored_chunks: Dictionary[Vector3i, VoxelChunk] = {}
 
@@ -81,9 +96,10 @@ var _mesh_tasks: Dictionary[Vector3i, ChunkTask] = {}
 # Cancelled tasks; waited for and their results dropped.
 var _abandoned_tasks: Array[ChunkTask] = []
 var _rebuild_queued := false
-var _material := StandardMaterial3D.new()
-# Stands in for chunks outside a contained world.
-var _air_chunk := VoxelChunk.new()
+var _material := ShaderMaterial.new()
+# Densities and types of an air chunk, standing in for empty chunks and those outside a contained
+# world when gathering mesh input.
+var _air_samples := PackedByteArray()
 
 
 # The worker writes result; the main thread reads it only after the task completes. cancelled is
@@ -95,8 +111,9 @@ class ChunkTask:
 
 
 func _init() -> void:
-	_material.vertex_color_use_as_albedo = true
-	_material.vertex_color_is_srgb = true
+	_material.shader = preload("voxel_terrain.gdshader")
+	_air_samples.resize(VoxelChunk.VOLUME)
+	_air_samples.fill(0)
 
 
 func _ready() -> void:
@@ -123,15 +140,19 @@ func _notification(what: int) -> void:
 			WorkerThreadPool.wait_for_task_completion(task.id)
 
 
-func set_voxel(world: Vector3i, density: float, type: VoxelChunk.Type) -> void:
+# density 0.0 (empty) to 1.0 (full), solid above 0.5; type indexes voxel_types.
+func set_voxel(world: Vector3i, density: float, type: int) -> void:
 	var coord := _chunk_coord(world)
 	# A contained world has no voxels outside its chunks; brushes reaching past the edge are clipped.
 	if _is_outside_world(coord):
 		return
 	var chunk := _get_chunk(coord)
 	authored_chunks[coord] = chunk
+	if chunk.densities.is_empty():
+		chunk.densities = _air_samples.duplicate()
+		chunk.types = _air_samples.duplicate()
 	var index := VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)
-	chunk.densities[index] = density
+	chunk.densities[index] = roundi(clampf(density, 0.0, 1.0) * 255.0)
 	chunk.types[index] = type
 	for z in range(-1, 2):
 		for y in range(-1, 2):
@@ -249,15 +270,21 @@ func _start_tasks() -> void:
 		if _mesh_tasks.has(coord) or not _has_neighbourhood(coord):
 			continue
 		_mesh_queue.erase(coord)
-		var chunk_densities: Array[PackedFloat32Array] = []
+		var chunk_densities: Array[PackedByteArray] = []
 		var chunk_types: Array[PackedByteArray] = []
 		for z in range(-1, 2):
 			for y in range(-1, 2):
 				for x in range(-1, 2):
 					var neighbour := coord + Vector3i(x, y, z)
-					var chunk: VoxelChunk = _air_chunk if _is_outside_world(neighbour) else _chunks[neighbour]
-					chunk_densities.append(chunk.densities)
-					chunk_types.append(chunk.types)
+					if _is_outside_world(neighbour) or _chunks[neighbour].densities.is_empty():
+						chunk_densities.append(_air_samples)
+						chunk_types.append(_air_samples)
+					else:
+						chunk_densities.append(_chunks[neighbour].densities)
+						chunk_types.append(_chunks[neighbour].types)
+		if _is_uniform(chunk_densities, 0) or _is_uniform(chunk_densities, 255):
+			_apply_mesh(coord, null)
+			continue
 		# Chunk-local sample bounds the gather clamps to; the default never clamps.
 		var sample_min := -Vector3i.ONE
 		var sample_max := Vector3i.ONE * (VoxelChunk.SIZE + 1)
@@ -298,24 +325,40 @@ func _generate_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator, coord:
 
 # Worker thread: must not touch members. The arrays hold the 3x3x3 chunks around the meshed chunk,
 # x fastest; they are copy-on-write snapshots, so set_voxel on the main thread cannot change them.
-func _mesh_chunk(task: ChunkTask, chunk_densities: Array[PackedFloat32Array],
+func _mesh_chunk(task: ChunkTask, chunk_densities: Array[PackedByteArray],
 		chunk_types: Array[PackedByteArray], sample_min: Vector3i, sample_max: Vector3i) -> void:
 	if task.cancelled:
 		return
-	var densities := PackedFloat32Array()
+	# Per axis and padded coordinate (chunk-local -1..SIZE+1, clamped): the source neighbour's
+	# contribution to its 0..26 index, and the source sample's to its sample_index.
+	var neighbour_parts: Array[PackedInt32Array] = []
+	var sample_parts: Array[PackedInt32Array] = []
+	for axis in 3:
+		var neighbour_part := PackedInt32Array()
+		var sample_part := PackedInt32Array()
+		for padded in MarchingCubes.PADDED:
+			var local := clampi(padded - 1, sample_min[axis], sample_max[axis])
+			var offset := floori(float(local) / VoxelChunk.SIZE)
+			neighbour_part.append((offset + 1) * 3 ** axis)
+			sample_part.append((local - offset * VoxelChunk.SIZE) * VoxelChunk.SIZE ** axis)
+		neighbour_parts.append(neighbour_part)
+		sample_parts.append(sample_part)
+	var densities := PackedByteArray()
 	densities.resize(MarchingCubes.PADDED ** 3)
 	var types := PackedByteArray()
 	types.resize(MarchingCubes.PADDED ** 3)
-	for z in range(-1, VoxelChunk.SIZE + 2):
-		for y in range(-1, VoxelChunk.SIZE + 2):
-			for x in range(-1, VoxelChunk.SIZE + 2):
-				var local := Vector3i(x, y, z).clamp(sample_min, sample_max)
-				var offset := _chunk_coord(local)
-				var neighbour := (offset.x + 1) + (offset.y + 1) * 3 + (offset.z + 1) * 9
-				var index := VoxelChunk.sample_index(local - offset * VoxelChunk.SIZE)
-				var padded_index := MarchingCubes.padded_index(Vector3i(x, y, z))
+	# Same order as MarchingCubes.padded_index, so the index just counts up.
+	var padded_index := 0
+	for z in MarchingCubes.PADDED:
+		for y in MarchingCubes.PADDED:
+			var row_neighbour := neighbour_parts[1][y] + neighbour_parts[2][z]
+			var row_sample := sample_parts[1][y] + sample_parts[2][z]
+			for x in MarchingCubes.PADDED:
+				var neighbour := row_neighbour + neighbour_parts[0][x]
+				var index := row_sample + sample_parts[0][x]
 				densities[padded_index] = chunk_densities[neighbour][index]
 				types[padded_index] = chunk_types[neighbour][index]
+				padded_index += 1
 	if task.cancelled:
 		return
 	# Building the ArrayMesh here is safe: resources may be created off the main thread.
@@ -335,6 +378,38 @@ func _apply_mesh(coord: Vector3i, mesh: ArrayMesh) -> void:
 		add_child(mesh_instance, false, Node.INTERNAL_MODE_BACK)
 		_meshes[coord] = mesh_instance
 	_meshes[coord].mesh = mesh
+
+
+# True when every chunk is entirely density: no ISO crossing, so no surface. A clamped gather
+# (outside_faces off) reads a subset of these chunks, so it holds there too.
+func _is_uniform(chunk_densities: Array[PackedByteArray], density: int) -> bool:
+	for densities in chunk_densities:
+		if densities.count(density) != VoxelChunk.VOLUME:
+			return false
+	return true
+
+
+# Packs the type textures into the Texture2DArray layers the shader indexes by type.
+func _update_textures() -> void:
+	if voxel_types.is_empty():
+		return
+	# Inspector edits pass through empty slots and types without a texture; wait until complete.
+	for voxel_type in voxel_types:
+		if voxel_type == null or voxel_type.texture == null:
+			return
+	var size := voxel_types[0].texture.get_size()
+	var images: Array[Image] = []
+	for voxel_type in voxel_types:
+		var image := voxel_type.texture.get_image()
+		if image.is_compressed():
+			image.decompress()
+		image.convert(Image.FORMAT_RGBA8)
+		image.resize(int(size.x), int(size.y))
+		image.generate_mipmaps()
+		images.append(image)
+	var textures := Texture2DArray.new()
+	textures.create_from_images(images)
+	_material.set_shader_parameter(&"type_textures", textures)
 
 
 func _has_neighbourhood(coord: Vector3i) -> bool:

@@ -2,6 +2,10 @@
 
 [ext_resource type="Script" path="res://voxel/voxel_terrain.gd" id="1_terrain"]
 [ext_resource type="Script" path="res://voxel/voxel_generator.gd" id="2_generator"]
+[ext_resource type="Script" path="res://voxel/voxel_type.gd" id="3_type"]
+[ext_resource type="Resource" path="res://voxel/demo/dirt.tres" id="4_dirt"]
+[ext_resource type="Resource" path="res://voxel/demo/grass.tres" id="5_grass"]
+[ext_resource type="Resource" path="res://voxel/demo/stone.tres" id="6_stone"]
 
 [sub_resource type="FastNoiseLite" id="FastNoiseLite_terrain"]
 
@@ -31,6 +35,7 @@ shadow_enabled = true
 [node name="VoxelTerrain" type="Node3D" parent="."]
 script = ExtResource("1_terrain")
 generator = SubResource("Resource_generator")
+voxel_types = Array[ExtResource("3_type")]([ExtResource("4_dirt"), ExtResource("5_grass"), ExtResource("6_stone")])
 
 [node name="Camera3D" type="Camera3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 0.832, 0.555, 0, -0.555, 0.832, 0, 40, 60)

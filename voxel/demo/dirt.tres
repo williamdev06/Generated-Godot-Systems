@@ -1,0 +1,8 @@
+[gd_resource type="Resource" script_class="VoxelType" format=3]
+
+[ext_resource type="Script" path="res://voxel/voxel_type.gd" id="1_type"]
+[ext_resource type="Texture2D" path="res://voxel/demo/textures/dirt.png" id="2_texture"]
+
+[resource]
+script = ExtResource("1_type")
+texture = ExtResource("2_texture")

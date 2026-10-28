@@ -2,21 +2,15 @@
 class_name MarchingCubes
 extends RefCounted
 # OWNS:       Turning a padded density/type grid into one chunk mesh with Marching Cubes.
-# DEPENDS:    VoxelChunk (SIZE, Type)
+# DEPENDS:    VoxelChunk (SIZE, ISO)
 # INVARIANTS: Input grids hold PADDED^3 samples covering chunk-local -1..SIZE+1 per axis (INV-7).
 #             CORNERS and EDGES must keep the numbering TRIANGLES was written for.
 # GOTCHAS:    With the case bit set for solid corners, TRIANGLES order gives Godot's clockwise
 #             front faces seen from the air side. Normals come from the density gradient, not the
 #             triangles, so both sides of a chunk border get identical normals and no seam shows.
+#             An edge vertex used only by mixed-type triangles stays in the buffer unreferenced.
 
 const PADDED := VoxelChunk.SIZE + 3
-
-# Indexed by VoxelChunk.Type.
-const TYPE_COLORS: Array[Color] = [
-	Color(0.42, 0.29, 0.18),
-	Color(0.33, 0.58, 0.2),
-	Color(0.5, 0.5, 0.5),
-]
 
 const CORNERS: Array[Vector3i] = [
 	Vector3i(0, 0, 0), Vector3i(1, 0, 0), Vector3i(1, 1, 0), Vector3i(0, 1, 0),
@@ -29,6 +23,17 @@ const EDGES: Array[Vector2i] = [
 	Vector2i(4, 5), Vector2i(5, 6), Vector2i(6, 7), Vector2i(7, 4),
 	Vector2i(0, 4), Vector2i(1, 5), Vector2i(2, 6), Vector2i(3, 7),
 ]
+
+# Padded-grid index offset of each corner in CORNERS.
+const CORNER_OFFSETS: Array[int] = [
+	0, 1, 1 + PADDED, PADDED,
+	PADDED * PADDED, 1 + PADDED * PADDED, 1 + PADDED + PADDED * PADDED, PADDED + PADDED * PADDED,
+]
+
+# Axis (0 x, 1 y, 2 z) each edge in EDGES runs along.
+const EDGE_AXES: Array[int] = [0, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2]
+
+const BARYCENTRIC: Array[Color] = [Color(1, 0, 0), Color(0, 1, 0), Color(0, 0, 1)]
 
 # Cube case (bit n set = corner n solid) -> edge triples, one per triangle. Paul Bourke's table.
 const TRIANGLES := [
@@ -291,50 +296,79 @@ const TRIANGLES := [
 ]
 
 
-# Returns null when the chunk has no surface.
-static func build_mesh(densities: PackedFloat32Array, types: PackedByteArray) -> ArrayMesh:
+# Returns null when the chunk has no surface. Every vertex carries its triangle's three voxel types
+# (CUSTOM0 rgb, in triangle corner order) and its barycentric weight for them (COLOR), which
+# voxel_terrain.gdshader blends by (D-21).
+static func build_mesh(densities: PackedByteArray, types: PackedByteArray) -> ArrayMesh:
 	var vertices := PackedVector3Array()
 	var normals := PackedVector3Array()
-	var colors := PackedColorArray()
+	var weights := PackedColorArray()
+	# RGBA8 per vertex, alpha unused.
+	var corner_types := PackedByteArray()
 	var indices := PackedInt32Array()
-	# Sample index pair -> vertex index, so cells sharing an edge share its vertex.
-	var edge_vertices := {}
+	# Edge (padded index of its lower sample * 3 + axis) -> its vertex, -1 until created. Triangles
+	# whose corners all have one type share these; mixed triangles use copies with their own weights.
+	var edge_vertices := PackedInt32Array()
+	edge_vertices.resize(PADDED ** 3 * 3)
+	edge_vertices.fill(-1)
+	var triangle_vertices := PackedInt32Array([0, 0, 0])
+	var triangle_types := PackedByteArray([0, 0, 0])
 	for z in VoxelChunk.SIZE:
 		for y in VoxelChunk.SIZE:
+			var cell_index := padded_index(Vector3i(0, y, z))
 			for x in VoxelChunk.SIZE:
-				var cell := Vector3i(x, y, z)
 				var case_index := 0
 				for corner in 8:
-					if densities[padded_index(cell + CORNERS[corner])] > 0.0:
+					if densities[cell_index + CORNER_OFFSETS[corner]] > VoxelChunk.ISO:
 						case_index |= 1 << corner
-				for edge: int in TRIANGLES[case_index]:
-					var start: Vector3i = cell + CORNERS[EDGES[edge].x]
-					var end: Vector3i = cell + CORNERS[EDGES[edge].y]
-					var start_index := padded_index(start)
-					var end_index := padded_index(end)
-					var key := Vector2i(mini(start_index, end_index), maxi(start_index, end_index))
-					if not edge_vertices.has(key):
-						var start_density := densities[start_index]
-						var end_density := densities[end_index]
-						var weight := start_density / (start_density - end_density)
-						edge_vertices[key] = vertices.size()
-						vertices.append(Vector3(start).lerp(Vector3(end), weight))
-						# Density rises into the solid, so the outward normal is the negative gradient.
-						var gradient := _gradient(densities, start).lerp(_gradient(densities, end), weight)
-						normals.append(-gradient.normalized())
-						var solid_index := start_index if start_density > 0.0 else end_index
-						colors.append(TYPE_COLORS[types[solid_index]])
-					indices.append(edge_vertices[key])
+				var edges: Array = TRIANGLES[case_index]
+				for triangle in range(0, edges.size(), 3):
+					for corner in 3:
+						var edge: int = edges[triangle + corner]
+						var start_index := cell_index + CORNER_OFFSETS[EDGES[edge].x]
+						var end_index := cell_index + CORNER_OFFSETS[EDGES[edge].y]
+						var key := mini(start_index, end_index) * 3 + EDGE_AXES[edge]
+						if edge_vertices[key] == -1:
+							var start_density := densities[start_index]
+							var end_density := densities[end_index]
+							var weight := (VoxelChunk.ISO - start_density) / (end_density - start_density)
+							var cell := Vector3i(x, y, z)
+							var start := Vector3(cell + CORNERS[EDGES[edge].x])
+							var end := Vector3(cell + CORNERS[EDGES[edge].y])
+							edge_vertices[key] = vertices.size()
+							vertices.append(start.lerp(end, weight))
+							# Density rises into the solid, so the outward normal is the negative gradient.
+							var gradient := _gradient(densities, start_index).lerp(_gradient(densities, end_index), weight)
+							normals.append(-gradient.normalized())
+							var solid_type := types[start_index if start_density > VoxelChunk.ISO else end_index]
+							weights.append(BARYCENTRIC[0])
+							corner_types.append_array(PackedByteArray([solid_type, solid_type, solid_type, 0]))
+						triangle_vertices[corner] = edge_vertices[key]
+						triangle_types[corner] = corner_types[edge_vertices[key] * 4]
+					if triangle_types[0] == triangle_types[1] and triangle_types[0] == triangle_types[2]:
+						indices.append_array(triangle_vertices)
+						continue
+					for corner in 3:
+						var shared := triangle_vertices[corner]
+						indices.append(vertices.size())
+						vertices.append(vertices[shared])
+						normals.append(normals[shared])
+						weights.append(BARYCENTRIC[corner])
+						corner_types.append_array(triangle_types)
+						corner_types.append(0)
+				cell_index += 1
 	if vertices.is_empty():
 		return null
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
 	arrays[Mesh.ARRAY_NORMAL] = normals
-	arrays[Mesh.ARRAY_COLOR] = colors
+	arrays[Mesh.ARRAY_COLOR] = weights
+	arrays[Mesh.ARRAY_CUSTOM0] = corner_types
 	arrays[Mesh.ARRAY_INDEX] = indices
 	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], {},
+		Mesh.ARRAY_CUSTOM_RGBA8_UNORM << Mesh.ARRAY_FORMAT_CUSTOM0_SHIFT)
 	return mesh
 
 
@@ -342,11 +376,9 @@ static func padded_index(local: Vector3i) -> int:
 	return (local.x + 1) + (local.y + 1) * PADDED + (local.z + 1) * PADDED * PADDED
 
 
-static func _gradient(densities: PackedFloat32Array, local: Vector3i) -> Vector3:
-	var right := densities[padded_index(local + Vector3i.RIGHT)]
-	var left := densities[padded_index(local + Vector3i.LEFT)]
-	var up := densities[padded_index(local + Vector3i.UP)]
-	var down := densities[padded_index(local + Vector3i.DOWN)]
-	var back := densities[padded_index(local + Vector3i.BACK)]
-	var forward := densities[padded_index(local + Vector3i.FORWARD)]
-	return Vector3(right - left, up - down, back - forward)
+static func _gradient(densities: PackedByteArray, index: int) -> Vector3:
+	return Vector3(
+		densities[index + 1] - densities[index - 1],
+		densities[index + PADDED] - densities[index - PADDED],
+		densities[index + PADDED * PADDED] - densities[index - PADDED * PADDED],
+	)
