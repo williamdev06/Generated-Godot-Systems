@@ -145,6 +145,13 @@ func set_voxel(world: Vector3i, density: float, type: VoxelChunk.Type) -> void:
 					_mesh_queue[neighbour] = true
 
 
+# set_voxel for each index; the editor's undo/redo replays strokes through this.
+func set_voxels(worlds: Array[Vector3i], densities: PackedFloat32Array,
+		types: PackedByteArray) -> void:
+	for index in worlds.size():
+		set_voxel(worlds[index], densities[index], types[index] as VoxelChunk.Type)
+
+
 # Chunks without data (not generated yet, unloaded, or outside a contained world) read as air.
 func get_density(world: Vector3i) -> float:
 	var coord := _chunk_coord(world)

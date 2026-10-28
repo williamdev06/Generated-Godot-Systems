@@ -45,6 +45,7 @@ Camera3D -> M-7: camera position (editor: EditorInterface viewport 0 camera; gam
 M-9 -> M-7: Resource.changed (also on noise change) -> full rebuild; deferred, coalesced
 M-7 -> M-10: MarchingCubes.build_mesh(padded densities, padded types) -> ArrayMesh or null on a worker thread; per chunk once its 26 neighbours have data, on rebuild and after set_voxel
 M-12 -> M-7: get_density/get_type reads (missing chunks read as air), set_voxel writes; on left click/drag in the 3D viewport with a tool active
+EditorUndoRedoManager -> M-7: set_voxels(worlds, densities, types) with a stroke's before/after values; on undo/redo
 
 ## INVARIANTS
 INV-1: Planet radii and transmittance/sky-view/panorama uv mappings are duplicated in shaders/atmosphere.glslinc, shaders/cloud_panorama.glsl and sky.gdshader. Change all, or the sky mismatches the clouds.
@@ -77,6 +78,7 @@ D-18 2026-10-28: Chunk generation and meshing run as WorkerThreadPool tasks (poo
 D-19 2026-10-28: chunk_extent is a range around the camera's chunk, not the origin. Leaving chunks lose mesh and (unless authored) data; queues are sorted nearest-first on every centre change; out-of-range tasks are cancelled by a flag polled between worker stages (no mid-loop abort, so M-9/M-10 stay untouched).
 D-20 2026-10-28: VoxelTerrain toggles infinite (D-19 streaming) vs contained (world_size chunks from the node origin, no streaming) and procedural (off = unauthored chunks are air). Contained worlds keep no data outside; outside_faces reads air there and also meshes chunk -1 on the low sides (their last cells hold the closing faces); off clamps the gather to the boundary samples so the terrain is cut open. set_voxel outside a contained world is ignored.
 D-21 2026-10-28: Editor picking marches density samples (nearest sample, 0.25-unit steps) instead of adding chunk collision. Sculpt add/remove are SDF union/subtraction with a sphere (density ~ distance, M-9); the density tool adds strength x linear falloff.
+D-22 2026-10-28: Editor strokes (press to release) apply live and commit one undo action, not executed on commit, holding only the changed samples' before/after values with the terrain as do/undo target. Smooth = 6-neighbour average, flatten = level at the stroke's start height (density h - y), both blended by linear falloff.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).
