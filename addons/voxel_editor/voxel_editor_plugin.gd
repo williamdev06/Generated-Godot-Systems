@@ -3,11 +3,10 @@ extends EditorPlugin
 # OWNS:       Viewport sculpting and voxel editing of the selected VoxelTerrain.
 # DEPENDS:    VoxelTerrain (get_density, get_type, set_voxel), VoxelChunk.Type, EditorInterface
 # INVARIANTS: Edits go through VoxelTerrain.set_voxel only, so they land in authored_chunks (D-17).
-# GOTCHAS:    Godot lists plugins only under res://addons; this one lives in voxel/ and is enabled
-#             by its plugin.cfg path in project.godot [editor_plugins]. Picking marches the density
-#             samples in terrain-local space, not the meshes (chunks have no collision); chunks
-#             without data read as air, so rays pass through them. Sculpt add/remove treat density
-#             as distance below the surface, which VoxelGenerator approximates. No undo.
+# GOTCHAS:    Picking marches the density samples in terrain-local space, not the meshes (chunks
+#             have no collision); chunks without data read as air, so rays pass through them.
+#             Sculpt add/remove treat density as distance below the surface, which VoxelGenerator
+#             approximates. No undo.
 
 enum Tool { SCULPT_ADD, SCULPT_REMOVE, VOXEL_PLACE, VOXEL_REMOVE, DENSITY }
 
