@@ -1,8 +1,8 @@
 @tool
 extends EditorPlugin
 # OWNS:       Viewport sculpting and voxel editing of the selected VoxelTerrain, with undo.
-# DEPENDS:    VoxelTerrain (get_density, get_type, set_voxel, set_voxels, voxel_types), VoxelChunk,
-#             EditorUndoRedoManager, RenderingServer
+# DEPENDS:    VoxelTerrain (get_density, get_type, set_voxel, set_voxels, get_voxel_types),
+#             VoxelChunk, EditorUndoRedoManager, RenderingServer
 # INVARIANTS: Edits go through _set_voxel only, so they land in the terrain's saved data
 #             (storage or model, D-25, D-26) and in the stroke's undo delta.
 # GOTCHAS:    Picking marches the density samples in terrain-local space, not the meshes (chunks
@@ -62,7 +62,7 @@ func _enter_tree() -> void:
 	_strength.step = 0.005
 	_strength.value = 0.03
 	_toolbar.add_child(_strength)
-	# Filled per terrain in _edit, indexed like VoxelTerrain.voxel_types.
+	# Filled per terrain in _edit, indexed like VoxelTerrain.get_voxel_types().
 	_toolbar.add_child(_type)
 	_toolbar.hide()
 	add_control_to_container(CONTAINER_SPATIAL_EDITOR_MENU, _toolbar)
@@ -93,8 +93,9 @@ func _edit(object: Object) -> void:
 	_has_hit = false
 	_type.clear()
 	if _terrain != null:
-		for index in _terrain.voxel_types.size():
-			var voxel_type := _terrain.voxel_types[index]
+		var voxel_types := _terrain.get_voxel_types()
+		for index in voxel_types.size():
+			var voxel_type := voxel_types[index]
 			# Types saved inside the scene have no file name to show.
 			var type_name := ""
 			if voxel_type != null:

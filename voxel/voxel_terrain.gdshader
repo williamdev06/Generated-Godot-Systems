@@ -1,6 +1,6 @@
 // OWNS:       Chunk surface albedo: per voxel type texture, triplanar, blended across type borders.
-// DEPENDS:    VoxelTerrain: binds type_textures (one layer per voxel_types entry). MarchingCubes
-//             vertex layout: CUSTOM0 rgb = triangle corner types / 255, COLOR rgb = barycentric
+// DEPENDS:    VoxelTerrain: binds type_textures (one layer per get_voxel_types() entry).
+//             MarchingCubes vertex layout: CUSTOM0 rgb = triangle corner types / 255, COLOR rgb = barycentric
 //             weight.
 // INVARIANTS: All three vertices of a triangle carry the same CUSTOM0, so the flat varying is the
 //             triangle's types whatever the provoking vertex (D-23).

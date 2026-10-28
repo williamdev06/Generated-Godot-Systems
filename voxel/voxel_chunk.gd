@@ -6,7 +6,7 @@ extends Resource
 # INVARIANTS: densities and types are both empty (all air) or both hold VOLUME entries laid out by
 #             sample_index (see INV-7). Density byte 0..255 is 0.0..1.0; above ISO (0.5) is solid,
 #             0 is empty; the surface is the ISO crossing (D-23). A type is an index into
-#             VoxelTerrain.voxel_types. encode/decode is the only saved form (INV-9).
+#             VoxelTerrain.get_voxel_types(). encode/decode is the only saved form (INV-9).
 # GOTCHAS:    @tool because VoxelTerrain creates chunks in the editor. A chunk owns samples
 #             0..SIZE-1 per axis only; meshing reads one sample past them on each side (INV-7), so
 #             edits near a chunk border change neighbour meshes too.

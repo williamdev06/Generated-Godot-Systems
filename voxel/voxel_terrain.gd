@@ -9,10 +9,10 @@ extends Node3D
 #             the generator. A chunk is never in both _chunks and _save_queue (D-25, D-26).
 # GOTCHAS:    @tool: everything is rebuilt in the editor when any export, the generator or its noise
 #             change. Chunk MeshInstance3Ds are internal children without an owner, so they are
-#             never saved into the scene. Without a generator, chunks not in storage are air. A chunk
-#             mesh reads samples one past its own on each side (INV-7), so remeshing pulls in
+#             never saved into the scene. Without a generator, chunks not in storage are air. A
+#             chunk mesh reads samples one past its own on each side (INV-7), so remeshing pulls in
 #             neighbour chunk data, generating chunks just outside chunk_extent.
-#             Contained worlds (D-20) store no chunks outside world_size; meshing reads air
+#             Contained worlds (D-20) store no chunks outside model.world_size; meshing reads air
 #             there (outside_faces) or repeats the boundary samples; set_voxel ignores them.
 #             Streaming (D-19, infinite only): follows the editor camera of 3D viewport 0 in the
 #             editor and the current camera in game. Chunks leaving the range lose their mesh and
@@ -39,7 +39,7 @@ extends Node3D
 			generator.changed.connect(_queue_rebuild)
 		_queue_rebuild()
 
-# Off: a contained world of world_size chunks from this node's origin along +x, +y, +z.
+# Off: a contained world of model.world_size chunks from this node's origin along +x, +y, +z.
 @export var infinite := true:
 	set(value):
 		infinite = value
@@ -57,12 +57,6 @@ extends Node3D
 		chunk_extent = value
 		_queue_rebuild()
 
-# Contained only.
-@export var world_size := Vector3i(4, 2, 4):
-	set(value):
-		world_size = value
-		_queue_rebuild()
-
 # Contained only: closes the surface where solid voxels touch the world boundary. Off leaves the
 # terrain cut open there.
 @export var outside_faces := true:
@@ -70,19 +64,12 @@ extends Node3D
 		outside_faces = value
 		_queue_rebuild()
 
-# A chunk's type byte indexes this; also the shader texture layer of each type. Changing it never
-# remeshes.
+# Infinite only (contained worlds use model.voxel_types): a chunk's type byte indexes this; also
+# the shader texture layer of each type. Changing it never remeshes.
 @export var voxel_types: Array[VoxelType] = []:
 	set(value):
-		for voxel_type in voxel_types:
-			if voxel_type != null:
-				voxel_type.changed.disconnect(_update_textures)
 		voxel_types = value
-		for voxel_type in voxel_types:
-			if voxel_type != null:
-				# Reference counted: the same type may be listed twice.
-				voxel_type.changed.connect(_update_textures, CONNECT_REFERENCE_COUNTED)
-		_update_textures()
+		_watch_types()
 
 # Infinite only: where chunks are saved and loaded. Without one, nothing is saved (warning).
 @export var storage: VoxelRegionStorage:
@@ -94,11 +81,15 @@ extends Node3D
 			storage.changed.connect(_queue_rebuild)
 		_queue_rebuild()
 
-# Contained only: where chunks are saved and loaded. Left empty, a model built into the scene is
+# Contained only: the world (size, types, chunks). Left empty, a model built into the scene is
 # created; save that as a file to reuse the terrain, or assign a model asset.
 @export var model: VoxelModel:
 	set(value):
+		if model != null:
+			model.changed.disconnect(_queue_rebuild)
 		model = value
+		if model != null:
+			model.changed.connect(_queue_rebuild)
 		_queue_rebuild()
 
 var _chunks: Dictionary[Vector3i, VoxelChunk] = {}
@@ -115,6 +106,8 @@ var _storage_snapshot: VoxelStorage
 var _unsaved: Dictionary[Vector3i, bool] = {}
 # Contained only: set_voxel ran since edits were last written to model.
 var _edits_pending := false
+# Types whose changed signal is connected to _update_textures (_watch_types).
+var _watched_types: Array[VoxelType] = []
 # Unloaded chunks waiting for the save task, and the ones it is writing.
 var _save_queue: Dictionary[Vector3i, VoxelChunk] = {}
 var _saving: Dictionary[Vector3i, VoxelChunk] = {}
@@ -192,7 +185,7 @@ func _get_configuration_warnings() -> PackedStringArray:
 	return PackedStringArray()
 
 
-# density 0.0 (empty) to 1.0 (full), solid above 0.5; type indexes voxel_types.
+# density 0.0 (empty) to 1.0 (full), solid above 0.5; type indexes get_voxel_types().
 func set_voxel(world: Vector3i, density: float, type: int) -> void:
 	var coord := _chunk_coord(world)
 	# A contained world has no voxels outside its chunks; brushes reaching past the edge are clipped.
@@ -275,6 +268,8 @@ func _rebuild() -> void:
 			# Queues one more rebuild through the setter; harmless.
 			model = VoxelModel.new()
 		_storage_snapshot = model
+	# The active palette may have switched with infinite or model.
+	_watch_types()
 	update_configuration_warnings()
 	# Existing meshes stay visible until their replacement arrives, so a rebuild does not flicker.
 	for coord in _meshes:
@@ -408,7 +403,7 @@ func _start_tasks() -> void:
 			# Repeating the boundary samples outward leaves no sign change, so no surface, there.
 			var origin := coord * VoxelChunk.SIZE
 			sample_min = sample_min.max(-origin)
-			sample_max = sample_max.min(world_size * VoxelChunk.SIZE - Vector3i.ONE - origin)
+			sample_max = sample_max.min(_world_size() * VoxelChunk.SIZE - Vector3i.ONE - origin)
 		var task := ChunkTask.new()
 		task.id = WorkerThreadPool.add_task(
 			_mesh_chunk.bind(task, chunk_densities, chunk_types, sample_min, sample_max))
@@ -519,17 +514,42 @@ func _is_uniform(chunk_densities: Array[PackedByteArray], density: int) -> bool:
 	return true
 
 
+# The palette chunk type bytes index: the model's in contained worlds, so a model asset brings its
+# types along (D-27).
+func get_voxel_types() -> Array[VoxelType]:
+	if infinite:
+		return voxel_types
+	if model == null:
+		var none: Array[VoxelType] = []
+		return none
+	return model.voxel_types
+
+
+# Connects the active types' changed signals to _update_textures and repacks the textures.
+func _watch_types() -> void:
+	for voxel_type in _watched_types:
+		voxel_type.changed.disconnect(_update_textures)
+	_watched_types.clear()
+	for voxel_type in get_voxel_types():
+		if voxel_type != null:
+			# Reference counted: the same type may be listed twice.
+			voxel_type.changed.connect(_update_textures, CONNECT_REFERENCE_COUNTED)
+			_watched_types.append(voxel_type)
+	_update_textures()
+
+
 # Packs the type textures into the Texture2DArray layers the shader indexes by type.
 func _update_textures() -> void:
-	if voxel_types.is_empty():
+	var types := get_voxel_types()
+	if types.is_empty():
 		return
 	# Inspector edits pass through empty slots and types without a texture; wait until complete.
-	for voxel_type in voxel_types:
+	for voxel_type in types:
 		if voxel_type == null or voxel_type.texture == null:
 			return
-	var size := voxel_types[0].texture.get_size()
+	var size := types[0].texture.get_size()
 	var images: Array[Image] = []
-	for voxel_type in voxel_types:
+	for voxel_type in types:
 		var image := voxel_type.texture.get_image()
 		if image.is_compressed():
 			image.decompress()
@@ -600,6 +620,11 @@ func _flush(edited_only: bool) -> void:
 		_unsaved.erase(coord)
 
 
+# Contained only: chunks along each axis, from the model (zero until the first rebuild creates it).
+func _world_size() -> Vector3i:
+	return model.world_size if model != null else Vector3i.ZERO
+
+
 # Chunks that get a mesh are [_mesh_begin(), _mesh_end()) per axis.
 func _mesh_begin() -> Vector3i:
 	if infinite:
@@ -609,7 +634,7 @@ func _mesh_begin() -> Vector3i:
 
 
 func _mesh_end() -> Vector3i:
-	return _center + chunk_extent if infinite else world_size
+	return _center + chunk_extent if infinite else _world_size()
 
 
 func _is_meshed(coord: Vector3i) -> bool:
@@ -621,11 +646,11 @@ func _is_loaded(coord: Vector3i) -> bool:
 	if infinite:
 		# One chunk past the meshed range: meshes read their neighbours' samples (INV-7).
 		return _is_in_box(coord, _mesh_begin() - Vector3i.ONE, _mesh_end() + Vector3i.ONE)
-	return _is_in_box(coord, Vector3i.ZERO, world_size)
+	return _is_in_box(coord, Vector3i.ZERO, _world_size())
 
 
 func _is_outside_world(coord: Vector3i) -> bool:
-	return not infinite and not _is_in_box(coord, Vector3i.ZERO, world_size)
+	return not infinite and not _is_in_box(coord, Vector3i.ZERO, _world_size())
 
 
 func _is_in_box(coord: Vector3i, begin: Vector3i, end: Vector3i) -> bool:

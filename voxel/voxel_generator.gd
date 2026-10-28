@@ -12,7 +12,7 @@ extends Resource
 #             BAND. Chunks entirely beyond the band skip the noise, assuming |noise| <= 1
 #             (UNVERIFIED for every FastNoiseLite noise type).
 
-# Indices into VoxelTerrain.voxel_types, which must list the types in this order.
+# Indices into VoxelTerrain.get_voxel_types(), which must list the types in this order.
 enum Type { DIRT, GRASS, STONE }
 
 const HEIGHT := 24.0
