@@ -39,9 +39,9 @@ M-4 aerial_perspective (raw, jittered) -> aerial_perspective_temporal -> accumul
 M-4 composite -> scene color buffer: aerial perspective on geometry + clouds; every frame
 M-1 -> M-6: shader globals cloud_shadow_area (AO map center, size, AO strength), cloud_shadow_sun, beer_shadow_center/tangent/bitangent; every _render_callback
 M-2 -> M-6: shader globals cloud_shadow_map (AO) and beer_shadow_map (sun shadow), Texture2DRDs of M-1's maps; on bind
-M-9 -> M-7: VoxelGenerator.generate(coord) -> VoxelChunk; first lookup of an unauthored chunk after a rebuild
+M-9 -> M-7: VoxelGenerator.generate(coord) -> VoxelChunk on a worker thread (snapshot generator); per unauthored chunk after a rebuild; synchronously in set_voxel if not yet generated
 M-9 -> M-7: Resource.changed (also on noise change) -> full rebuild; deferred, coalesced
-M-7 -> M-10: MarchingCubes.build_mesh(padded densities, padded types) -> ArrayMesh or null; per chunk on rebuild and on set_voxel (deferred flush)
+M-7 -> M-10: MarchingCubes.build_mesh(padded densities, padded types) -> ArrayMesh or null on a worker thread; per chunk once its 26 neighbours have data, on rebuild and after set_voxel
 
 ## INVARIANTS
 INV-1: Planet radii and transmittance/sky-view/panorama uv mappings are duplicated in shaders/atmosphere.glslinc, shaders/cloud_panorama.glsl and sky.gdshader. Change all, or the sky mismatches the clouds.
@@ -70,6 +70,7 @@ D-14 2026-10-28: Every tuning value (cloud layer, noise scales, phase/multi-scat
 D-15 2026-10-28: Cloud AO is absolute (receiver's own sky visibility, scaled by cloud_ao_strength) because camera-relative AO (D-6) vanished whenever the camera flew under clouds. Accepts some double-darkening with the cubemap; tune with cloud_ao_strength.
 D-16 2026-10-28: Performance (1080p viewport 2.7-3.0 -> 1.6-1.9 ms, RTX 3070): aerial perspective marches each froxel column once (O(slices)); clouds take 3x steps through empty space and back up on hit, skip detail beyond cloud_detail_lod_distance_km, halve light steps once transmittance < 0.3, reuse the sample's weather in the light march; shadow maps refresh every shadow_map_update_interval frames with their frame/center stored; the sky cubemap and cloud panorama refresh every sky_update_interval frames (sky shader uses no TIME/POSITION; VolumetricSky bumps refresh_index). AO map defaults to 256.
 D-17 2026-10-28: Voxel content = generator output overridden per chunk by authored chunks (VoxelTerrain.authored_chunks, saved with the scene); set_voxel turns a chunk authored. Density > 0 is solid, one sample per world unit, 16^3 per chunk; types colour vertices (solid edge endpoint) via one vertex-colour material.
+D-18 2026-10-28: Chunk generation and meshing run as WorkerThreadPool tasks (pool sized to the CPU by Godot), at most OS.get_processor_count() in flight so rebuilds drop queued work and deletion waits briefly. Workers get a generator duplicate and copy-on-write sample arrays, never live state; results are applied in _process. ArrayMesh is built on the worker; nodes are added on the main thread.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).
