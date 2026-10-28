@@ -19,6 +19,11 @@ Target: Windows, D3D12
 | M-4 | volumetric_sky/shaders/ | Compute passes: LUTs, noise, clouds, composite | M-1 dispatch | active |
 | M-5 | volumetric_sky/demo/ | Reference scene wiring M-1..M-3, M-6 | M-1, M-2, M-3, M-6 | active |
 | M-6 | volumetric_sky/cloud_shadow.gdshaderinc | Cloud shadow, cloud AO, drop-in light() for materials | shader globals from M-1, M-2 | active |
+| M-7 | voxel/voxel_terrain.gd | 3D chunk grid, chunk meshes, voxel edits | M-8, M-9, M-10 | active |
+| M-8 | voxel/voxel_chunk.gd | Per-chunk density and voxel type samples | none | active |
+| M-9 | voxel/voxel_generator.gd | Procedural chunk density and type | M-8, FastNoiseLite | active |
+| M-10 | voxel/marching_cubes.gd | Padded density grid to chunk ArrayMesh | M-8 | active |
+| M-11 | voxel/demo/ | Reference scene for M-7 with M-9 | M-7, M-9 | active |
 
 <!-- status: stable | active | stub | deprecated -->
 
@@ -34,6 +39,9 @@ M-4 aerial_perspective (raw, jittered) -> aerial_perspective_temporal -> accumul
 M-4 composite -> scene color buffer: aerial perspective on geometry + clouds; every frame
 M-1 -> M-6: shader globals cloud_shadow_area (AO map center, size, AO strength), cloud_shadow_sun, beer_shadow_center/tangent/bitangent; every _render_callback
 M-2 -> M-6: shader globals cloud_shadow_map (AO) and beer_shadow_map (sun shadow), Texture2DRDs of M-1's maps; on bind
+M-9 -> M-7: VoxelGenerator.generate(coord) -> VoxelChunk; first lookup of an unauthored chunk after a rebuild
+M-9 -> M-7: Resource.changed (also on noise change) -> full rebuild; deferred, coalesced
+M-7 -> M-10: MarchingCubes.build_mesh(padded densities, padded types) -> ArrayMesh or null; per chunk on rebuild and on set_voxel (deferred flush)
 
 ## INVARIANTS
 INV-1: Planet radii and transmittance/sky-view/panorama uv mappings are duplicated in shaders/atmosphere.glslinc, shaders/cloud_panorama.glsl and sky.gdshader. Change all, or the sky mismatches the clouds.
@@ -42,6 +50,7 @@ INV-3: RDUniform bindings and texture sizes in M-1 match each shader's declarati
 INV-4: The sun above the atmosphere is white with illuminance = light energy x PI, matching Godot's internal directional light scaling. The light's color carries the atmosphere transmittance, so anything reading LIGHT0_COLOR / LIGHT_COLOR must not apply transmittance again. The CPU transmittance in M-1 mirrors atmosphere.glslinc constants and haze scaling (INV-1).
 INV-5: The AO map uv mapping is duplicated in shaders/cloud_shadow_map.glsl and cloud_shadow.gdshaderinc; the cloud top reaches materials via cloud_shadow_sun.w. All seven shader globals M-6 declares must stay registered in project.godot [shader_globals], or every material using M-6 fails to compile.
 INV-6: The Beer shadow map frame (center, tangent, bitangent, extent; built in _beer_shadow_frame) is the only definition: beer_shadow_map.glsl writes with it; aerial_perspective.glsl (params) and cloud_shadow.gdshaderinc (globals) read with the same lookup. Depth is measured along -sun from the map plane.
+INV-7: A chunk's mesh reads the padded grid chunk-local -1..SIZE+1 (SIZE+3 per axis): cells 0..SIZE-1 need the +1 corner, gradient normals need one more on each side. MarchingCubes.PADDED, padded_index, VoxelTerrain._remesh and set_voxel's dirty test must agree, or chunk borders crack or keep stale meshes.
 
 ## DECISIONS
 D-1 2026-10-28: Hybrid rendering. A compute CompositorEffect draws on-screen atmosphere and clouds (depth-aware, fly-through); the sky shader only samples compute LUTs via Texture2DRD to supply the background and radiance cubemap.
@@ -60,6 +69,7 @@ D-13 2026-10-28: Material sun shadows use the Beer shadow map (correct inside/ab
 D-14 2026-10-28: Every tuning value (cloud layer, noise scales, phase/multi-scattering/ambient/albedo, quality, ground albedo, shadow map sizes) is a grouped export on M-1 packed into params; the sun disc brightness is a sky material uniform. Shadow maps resize live: replaced textures are freed RETIRE_DELAY_FRAMES later so M-2 can rebind. Procedural coverage/type comes from a 512^2 Perlin fBm texture (weather_gen.glsl) instead of a slice of the shape noise, removing straight cloud edges. Beer map cloudless texels store front = layer entry (not a far sentinel) so bilinear filtering stays smooth.
 D-15 2026-10-28: Cloud AO is absolute (receiver's own sky visibility, scaled by cloud_ao_strength) because camera-relative AO (D-6) vanished whenever the camera flew under clouds. Accepts some double-darkening with the cubemap; tune with cloud_ao_strength.
 D-16 2026-10-28: Performance (1080p viewport 2.7-3.0 -> 1.6-1.9 ms, RTX 3070): aerial perspective marches each froxel column once (O(slices)); clouds take 3x steps through empty space and back up on hit, skip detail beyond cloud_detail_lod_distance_km, halve light steps once transmittance < 0.3, reuse the sample's weather in the light march; shadow maps refresh every shadow_map_update_interval frames with their frame/center stored; the sky cubemap and cloud panorama refresh every sky_update_interval frames (sky shader uses no TIME/POSITION; VolumetricSky bumps refresh_index). AO map defaults to 256.
+D-17 2026-10-28: Voxel content = generator output overridden per chunk by authored chunks (VoxelTerrain.authored_chunks, saved with the scene); set_voxel turns a chunk authored. Density > 0 is solid, one sample per world unit, 16^3 per chunk; types colour vertices (solid edge endpoint) via one vertex-colour material.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).

@@ -1,0 +1,36 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://voxel/voxel_terrain.gd" id="1_terrain"]
+[ext_resource type="Script" path="res://voxel/voxel_generator.gd" id="2_generator"]
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_terrain"]
+
+[sub_resource type="Resource" id="Resource_generator"]
+script = ExtResource("2_generator")
+noise = SubResource("FastNoiseLite_terrain")
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_main"]
+
+[sub_resource type="Sky" id="Sky_main"]
+sky_material = SubResource("ProceduralSkyMaterial_main")
+
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 2
+sky = SubResource("Sky_main")
+ambient_light_source = 3
+
+[node name="Demo" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_main")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.5, 0.866025, 0, -0.866025, 0.5, 0, 0, 0)
+shadow_enabled = true
+
+[node name="VoxelTerrain" type="Node3D" parent="."]
+script = ExtResource("1_terrain")
+generator = SubResource("Resource_generator")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.832, 0.555, 0, -0.555, 0.832, 0, 40, 60)
