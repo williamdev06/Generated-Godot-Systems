@@ -7,15 +7,15 @@ extends EditorPlugin
 #             stroke's undo delta.
 # GOTCHAS:    Picking marches the density samples in terrain-local space, not the meshes (chunks
 #             have no collision); chunks without data read as air, so rays pass through them.
-#             Sculpt add/remove and flatten write distance below the surface mapped to density
+#             Sculpt and flatten write distance below the surface mapped to density
 #             0..1 by VoxelChunk.BAND, as VoxelGenerator does (D-23); solid is above 0.5. Edits
 #             apply live; the undo action is committed without executing on mouse release. Undo
 #             restores samples but chunks stay authored.
 #             The brush cursor is a RenderingServer instance, not a node, so it never enters the
 #             edited scene.
 
-enum Tool { NONE, SCULPT_ADD, SCULPT_REMOVE, VOXEL_PLACE, VOXEL_REMOVE, DENSITY, SMOOTH, FLATTEN,
-	PAINT }
+# Sculpt, Voxel and Density add on click and subtract on shift+click.
+enum Tool { NONE, SCULPT, VOXEL, DENSITY, SMOOTH, FLATTEN, PAINT }
 
 const NEIGHBOUR_OFFSETS: Array[Vector3i] = [
 	Vector3i.LEFT, Vector3i.RIGHT, Vector3i.DOWN, Vector3i.UP, Vector3i.FORWARD, Vector3i.BACK,
@@ -34,6 +34,8 @@ var _has_hit := false
 var _hit_position := Vector3.ZERO
 var _hit_sample := Vector3i.ZERO
 var _place_sample := Vector3i.ZERO
+# Shift state of the last mouse event.
+var _subtract := false
 # Flatten levels to the height where the stroke started.
 var _flatten_height := 0.0
 # Undo delta of the current stroke: each changed sample's value before the stroke touched it.
@@ -52,9 +54,10 @@ func _enter_tree() -> void:
 	_radius.value = 4.0
 	_radius.value_changed.connect(_update_cursor.unbind(1))
 	_toolbar.add_child(_radius)
-	# Density tool only: added to the density at the brush centre per stroke step; negative lowers.
+	# Density tool only: added to (subtracted from, with shift) the density at the brush centre per
+	# stroke step.
 	_strength.prefix = "Strength"
-	_strength.min_value = -0.25
+	_strength.min_value = 0.0
 	_strength.max_value = 0.25
 	_strength.step = 0.005
 	_strength.value = 0.03
@@ -115,6 +118,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 				_radius.value += 1.0 if mouse_button.button_index == MOUSE_BUTTON_WHEEL_UP else -1.0
 			return AFTER_GUI_INPUT_STOP
 		if mouse_button.button_index == MOUSE_BUTTON_LEFT:
+			_subtract = mouse_button.shift_pressed
 			if mouse_button.pressed:
 				_pick(camera, mouse_button.position)
 				_flatten_height = _hit_position.y
@@ -125,9 +129,10 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 			return AFTER_GUI_INPUT_STOP
 	var motion := event as InputEventMouseMotion
 	if motion != null:
+		_subtract = motion.shift_pressed
 		_pick(camera, motion.position)
-		# Single-voxel tools act per click; dragging them would stack voxels toward the camera.
-		var is_brush := _tool.selected not in [Tool.VOXEL_PLACE, Tool.VOXEL_REMOVE]
+		# The voxel tool acts per click; dragging it would stack voxels toward the camera.
+		var is_brush := _tool.selected != Tool.VOXEL
 		if motion.button_mask & MOUSE_BUTTON_MASK_LEFT and is_brush:
 			_edit_at_hit()
 			return AFTER_GUI_INPUT_STOP
@@ -162,12 +167,9 @@ func _update_cursor() -> void:
 		return
 	var center := _hit_position
 	var radius := _radius.value
-	# Single-voxel tools show the sample they would change.
-	if _tool.selected == Tool.VOXEL_PLACE:
-		center = Vector3(_place_sample)
-		radius = 0.5
-	elif _tool.selected == Tool.VOXEL_REMOVE:
-		center = Vector3(_hit_sample)
+	# The voxel tool shows the sample it would change.
+	if _tool.selected == Tool.VOXEL:
+		center = Vector3(_hit_sample if _subtract else _place_sample)
 		radius = 0.5
 	RenderingServer.instance_set_scenario(_cursor, _terrain.get_world_3d().scenario)
 	RenderingServer.instance_set_transform(_cursor,
@@ -177,14 +179,13 @@ func _update_cursor() -> void:
 func _edit_at_hit() -> void:
 	if not _has_hit:
 		return
-	match _tool.selected:
-		Tool.VOXEL_PLACE:
-			_set_voxel(_place_sample, 1.0, _type.selected)
-		Tool.VOXEL_REMOVE:
-			# Air samples' types are never read when meshing.
-			_set_voxel(_hit_sample, 0.0, _type.selected)
-		_:
-			_brush()
+	if _tool.selected != Tool.VOXEL:
+		_brush()
+	elif _subtract:
+		# Air samples' types are never read when meshing.
+		_set_voxel(_hit_sample, 0.0, _type.selected)
+	else:
+		_set_voxel(_place_sample, 1.0, _type.selected)
 
 
 func _brush() -> void:
@@ -205,12 +206,14 @@ func _brush() -> void:
 				var density := _terrain.get_density(sample)
 				match _tool.selected:
 					# Signed distance union/subtraction with the brush sphere.
-					Tool.SCULPT_ADD:
-						new_densities[sample] = maxf(density, _distance_density(radius - distance))
-					Tool.SCULPT_REMOVE:
-						new_densities[sample] = minf(density, _distance_density(distance - radius))
+					Tool.SCULPT:
+						if _subtract:
+							new_densities[sample] = minf(density, _distance_density(distance - radius))
+						else:
+							new_densities[sample] = maxf(density, _distance_density(radius - distance))
 					Tool.DENSITY:
-						new_densities[sample] = density + _strength.value * falloff
+						var strength := -_strength.value if _subtract else _strength.value
+						new_densities[sample] = density + strength * falloff
 					Tool.SMOOTH:
 						new_densities[sample] = lerpf(density, _neighbour_average(sample), falloff)
 					# A level surface at height h has distance h - y.
