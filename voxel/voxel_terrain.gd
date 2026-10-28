@@ -243,7 +243,7 @@ func _start_tasks() -> void:
 		task.id = WorkerThreadPool.add_task(_generate_chunk.bind(task, _generator_snapshot, coord))
 		_generation_tasks[coord] = task
 		free_slots -= 1
-	for coord in _mesh_queue.keys():
+	for coord: Vector3i in _mesh_queue.keys():
 		if free_slots <= 0:
 			return
 		if _mesh_tasks.has(coord) or not _has_neighbourhood(coord):
