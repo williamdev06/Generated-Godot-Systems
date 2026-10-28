@@ -82,7 +82,7 @@ var _mesh_tasks: Dictionary[Vector3i, ChunkTask] = {}
 var _abandoned_tasks: Array[ChunkTask] = []
 var _rebuild_queued := false
 var _material := StandardMaterial3D.new()
-# Stands in for chunks outside a contained world.
+# Stands in for chunks outside a contained world and for missing chunks in get_density/get_type.
 var _air_chunk := VoxelChunk.new()
 
 
@@ -143,6 +143,19 @@ func set_voxel(world: Vector3i, density: float, type: VoxelChunk.Type) -> void:
 					and padded.z < MarchingCubes.PADDED
 				if in_padded_grid and _is_meshed(neighbour):
 					_mesh_queue[neighbour] = true
+
+
+# Chunks without data (not generated yet, unloaded, or outside a contained world) read as air.
+func get_density(world: Vector3i) -> float:
+	var coord := _chunk_coord(world)
+	var chunk: VoxelChunk = _chunks.get(coord, _air_chunk)
+	return chunk.densities[VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)]
+
+
+func get_type(world: Vector3i) -> VoxelChunk.Type:
+	var coord := _chunk_coord(world)
+	var chunk: VoxelChunk = _chunks.get(coord, _air_chunk)
+	return chunk.types[VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)] as VoxelChunk.Type
 
 
 func _queue_rebuild() -> void:

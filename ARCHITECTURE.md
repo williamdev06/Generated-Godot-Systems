@@ -24,6 +24,7 @@ Target: Windows, D3D12
 | M-9 | voxel/voxel_generator.gd | Procedural chunk density and type | M-8, FastNoiseLite | active |
 | M-10 | voxel/marching_cubes.gd | Padded density grid to chunk ArrayMesh | M-8 | active |
 | M-11 | voxel/demo/ | Reference scene for M-7 with M-9 | M-7, M-9 | active |
+| M-12 | voxel/editor/ | Editor sculpt and voxel tools for M-7 | M-7, M-8, EditorPlugin | active |
 
 <!-- status: stable | active | stub | deprecated -->
 
@@ -43,6 +44,7 @@ M-9 -> M-7: VoxelGenerator.generate(coord) -> VoxelChunk on a worker thread (sna
 Camera3D -> M-7: camera position (editor: EditorInterface viewport 0 camera; game: viewport camera); every _process, _refresh when its chunk changes
 M-9 -> M-7: Resource.changed (also on noise change) -> full rebuild; deferred, coalesced
 M-7 -> M-10: MarchingCubes.build_mesh(padded densities, padded types) -> ArrayMesh or null on a worker thread; per chunk once its 26 neighbours have data, on rebuild and after set_voxel
+M-12 -> M-7: get_density/get_type reads (missing chunks read as air), set_voxel writes; on left click/drag in the 3D viewport with a tool active
 
 ## INVARIANTS
 INV-1: Planet radii and transmittance/sky-view/panorama uv mappings are duplicated in shaders/atmosphere.glslinc, shaders/cloud_panorama.glsl and sky.gdshader. Change all, or the sky mismatches the clouds.
@@ -74,6 +76,7 @@ D-17 2026-10-28: Voxel content = generator output overridden per chunk by author
 D-18 2026-10-28: Chunk generation and meshing run as WorkerThreadPool tasks (pool sized to the CPU by Godot), at most OS.get_processor_count() in flight so rebuilds drop queued work and deletion waits briefly. Workers get a generator duplicate and copy-on-write sample arrays, never live state; results are applied in _process. ArrayMesh is built on the worker; nodes are added on the main thread.
 D-19 2026-10-28: chunk_extent is a range around the camera's chunk, not the origin. Leaving chunks lose mesh and (unless authored) data; queues are sorted nearest-first on every centre change; out-of-range tasks are cancelled by a flag polled between worker stages (no mid-loop abort, so M-9/M-10 stay untouched).
 D-20 2026-10-28: VoxelTerrain toggles infinite (D-19 streaming) vs contained (world_size chunks from the node origin, no streaming) and procedural (off = unauthored chunks are air). Contained worlds keep no data outside; outside_faces reads air there and also meshes chunk -1 on the low sides (their last cells hold the closing faces); off clamps the gather to the boundary samples so the terrain is cut open. set_voxel outside a contained world is ignored.
+D-21 2026-10-28: Editor picking marches density samples (nearest sample, 0.25-unit steps) instead of adding chunk collision. Sculpt add/remove are SDF union/subtraction with a sphere (density ~ distance, M-9); the density tool adds strength x linear falloff. M-12 lives in voxel/editor, enabled by path in project.godot.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).
