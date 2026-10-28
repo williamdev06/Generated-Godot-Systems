@@ -3,10 +3,12 @@ class_name VoxelTerrain
 extends Node3D
 # OWNS:       The 3D chunk grid, infinite (streamed around the camera) or contained: threaded
 #             generation and meshing, edits.
-# DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, VoxelType, voxel_terrain.gdshader,
-#             WorkerThreadPool
-# INVARIANTS: An authored chunk is the same object in authored_chunks and _chunks, so edits land in
-#             the saved data; authored chunks override the generator (see D-17, D-23).
+# DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, VoxelType, VoxelRegionStorage,
+#             voxel_terrain.gdshader, WorkerThreadPool
+# INVARIANTS: Contained worlds: an authored chunk is the same object in authored_chunks and _chunks,
+#             so edits land in the saved scene; authored chunks override the generator (D-17, D-23).
+#             Infinite worlds: every chunk not loaded from storage is in _unsaved until written,
+#             and a chunk is never in both _chunks and _save_queue (D-25).
 # GOTCHAS:    @tool: everything is rebuilt in the editor when any export, the generator or its noise
 #             change. Chunk MeshInstance3Ds are internal children without an owner, so they are
 #             never saved into the scene. Without a generator, unauthored chunks are air. A chunk
@@ -23,6 +25,9 @@ extends Node3D
 #             _process, which also runs in the editor. Cancelling only sets a flag the worker checks
 #             between stages; the task still has to be waited for (_abandoned_tasks).
 #             Chunks whose 3x3x3 neighbourhood is uniformly air or uniformly full get no mesh task.
+#             Storage (D-25, infinite only): unloaded chunks are written by one save task at a time;
+#             editor scene save, rebuild and deletion write synchronously. A chunk wanted again
+#             before its save finished is taken back from the queue, never reloaded stale.
 
 @export var generator: VoxelGenerator:
 	set(value):
@@ -78,7 +83,17 @@ extends Node3D
 				voxel_type.changed.connect(_update_textures, CONNECT_REFERENCE_COUNTED)
 		_update_textures()
 
-# Chunks changed through set_voxel, saved with the scene.
+# Infinite only: where chunks are saved and loaded. Without one, nothing is saved (warning).
+@export var storage: VoxelRegionStorage:
+	set(value):
+		if storage != null:
+			storage.changed.disconnect(_queue_rebuild)
+		storage = value
+		if storage != null:
+			storage.changed.connect(_queue_rebuild)
+		_queue_rebuild()
+
+# Contained only: chunks changed through set_voxel, saved with the scene.
 @export_storage var authored_chunks: Dictionary[Vector3i, VoxelChunk] = {}
 
 var _chunks: Dictionary[Vector3i, VoxelChunk] = {}
@@ -88,6 +103,14 @@ var _meshes: Dictionary[Vector3i, MeshInstance3D] = {}
 var _center := Vector3i.ZERO
 # Read by worker threads instead of generator, so inspector edits never race a running task.
 var _generator_snapshot: VoxelGenerator
+# Same for storage; null when infinite is off or no storage directory is set.
+var _storage_snapshot: VoxelRegionStorage
+# Infinite only: loaded chunks not yet written to storage; true when edited (kept on rebuild).
+var _unsaved: Dictionary[Vector3i, bool] = {}
+# Unloaded chunks waiting for the save task, and the ones it is writing.
+var _save_queue: Dictionary[Vector3i, VoxelChunk] = {}
+var _saving: Dictionary[Vector3i, VoxelChunk] = {}
+var _save_task: ChunkTask
 # Both queues are kept nearest-first (_refresh); dictionaries iterate in insertion order.
 var _generation_queue: Array[Vector3i] = []
 # Chunks waiting for a mesh; started once they and their 26 neighbours have data.
@@ -109,6 +132,8 @@ class ChunkTask:
 	var id: int
 	var result: Variant
 	var cancelled := false
+	# Generation only: result came from storage rather than the generator.
+	var loaded := false
 
 
 func _init() -> void:
@@ -139,6 +164,15 @@ func _notification(what: int) -> void:
 			_cancel(task)
 		for task in _abandoned_tasks:
 			WorkerThreadPool.wait_for_task_completion(task.id)
+		_flush(false)
+	elif what == NOTIFICATION_EDITOR_PRE_SAVE:
+		_flush(false)
+
+
+func _get_configuration_warnings() -> PackedStringArray:
+	if infinite and (storage == null or storage.directory.is_empty()):
+		return PackedStringArray(["No storage directory selected: this infinite world is not saved."])
+	return PackedStringArray()
 
 
 # density 0.0 (empty) to 1.0 (full), solid above 0.5; type indexes voxel_types.
@@ -148,7 +182,10 @@ func set_voxel(world: Vector3i, density: float, type: int) -> void:
 	if _is_outside_world(coord):
 		return
 	var chunk := _get_chunk(coord)
-	authored_chunks[coord] = chunk
+	if infinite:
+		_unsaved[coord] = true
+	else:
+		authored_chunks[coord] = chunk
 	if chunk.densities.is_empty():
 		chunk.densities = _air_samples.duplicate()
 		chunk.types = _air_samples.duplicate()
@@ -207,11 +244,19 @@ func _rebuild() -> void:
 		_cancel(task)
 	_generation_tasks.clear()
 	_mesh_tasks.clear()
+	# Edits survive into the old storage; chunks the old generator made would only be stale.
+	_flush(true)
+	_unsaved.clear()
 	_chunks.clear()
-	_chunks.merge(authored_chunks)
+	if not infinite:
+		_chunks.merge(authored_chunks)
 	_generator_snapshot = null
 	if generator != null and procedural:
 		_generator_snapshot = generator.duplicate(true) as VoxelGenerator
+	_storage_snapshot = null
+	if infinite and storage != null and not storage.directory.is_empty():
+		_storage_snapshot = storage.duplicate() as VoxelRegionStorage
+	update_configuration_warnings()
 	# Existing meshes stay visible until their replacement arrives, so a rebuild does not flicker.
 	for coord in _meshes:
 		_mesh_queue[coord] = true
@@ -235,6 +280,9 @@ func _refresh() -> void:
 			_generation_tasks.erase(coord)
 	for coord in _chunks.keys():
 		if not _is_loaded(coord) and not authored_chunks.has(coord):
+			if _unsaved.has(coord) and _storage_snapshot != null:
+				_save_queue[coord] = _chunks[coord]
+			_unsaved.erase(coord)
 			_chunks.erase(coord)
 	var mesh_coords := _mesh_queue.keys().filter(_is_meshed)
 	_generation_queue.clear()
@@ -263,6 +311,9 @@ func _finish_tasks() -> void:
 	for index in range(_abandoned_tasks.size() - 1, -1, -1):
 		if _try_complete(_abandoned_tasks[index]):
 			_abandoned_tasks.remove_at(index)
+	if _save_task != null and _try_complete(_save_task):
+		_save_task = null
+		_saving.clear()
 	for coord in _generation_tasks.keys():
 		var task: ChunkTask = _generation_tasks[coord]
 		if _try_complete(task):
@@ -270,6 +321,8 @@ func _finish_tasks() -> void:
 			# set_voxel may have created the chunk while the task ran; the edit wins.
 			if not _chunks.has(coord):
 				_chunks[coord] = task.result
+				if infinite and not task.loaded:
+					_unsaved[coord] = false
 	for coord in _mesh_tasks.keys():
 		var task: ChunkTask = _mesh_tasks[coord]
 		if _try_complete(task):
@@ -280,14 +333,32 @@ func _finish_tasks() -> void:
 # Tasks in flight are capped at the core count (the pool's default size), so a rebuild or
 # deletion only ever waits for a handful of chunks and queued work can still be dropped.
 func _start_tasks() -> void:
+	if _save_task == null and not _save_queue.is_empty():
+		var coords: Array[Vector3i] = []
+		var chunk_densities: Array[PackedByteArray] = []
+		var chunk_types: Array[PackedByteArray] = []
+		for coord in _save_queue:
+			coords.append(coord)
+			chunk_densities.append(_save_queue[coord].densities)
+			chunk_types.append(_save_queue[coord].types)
+		_saving = _save_queue.duplicate()
+		_save_queue.clear()
+		_save_task = ChunkTask.new()
+		_save_task.id = WorkerThreadPool.add_task(
+			_save_chunks.bind(_storage_snapshot, coords, chunk_densities, chunk_types))
 	var task_count := _abandoned_tasks.size() + _generation_tasks.size() + _mesh_tasks.size()
 	var free_slots := OS.get_processor_count() - task_count
 	while free_slots > 0 and not _generation_queue.is_empty():
 		var coord: Vector3i = _generation_queue.pop_front()
 		if _chunks.has(coord):
 			continue
+		var reclaimed := _reclaim(coord)
+		if reclaimed != null:
+			_chunks[coord] = reclaimed
+			continue
 		var task := ChunkTask.new()
-		task.id = WorkerThreadPool.add_task(_generate_chunk.bind(task, _generator_snapshot, coord))
+		task.id = WorkerThreadPool.add_task(
+			_generate_chunk.bind(task, _generator_snapshot, _storage_snapshot, coord))
 		_generation_tasks[coord] = task
 		free_slots -= 1
 	for coord: Vector3i in _mesh_queue.keys():
@@ -340,13 +411,27 @@ func _try_complete(task: ChunkTask) -> bool:
 
 
 # Worker thread: must not touch members.
-func _generate_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator, coord: Vector3i) -> void:
+func _generate_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator,
+		storage_snapshot: VoxelRegionStorage, coord: Vector3i) -> void:
 	if task.cancelled:
+		return
+	if storage_snapshot != null:
+		task.result = storage_snapshot.load_chunk(coord)
+		task.loaded = task.result != null
+	if task.loaded:
 		return
 	if generator_snapshot != null:
 		task.result = generator_snapshot.generate(coord)
 	else:
 		task.result = VoxelChunk.new()
+
+
+# Worker thread: must not touch members. Gets copy-on-write sample arrays, not the chunks, because
+# a reclaimed chunk can be edited on the main thread while this runs.
+func _save_chunks(storage_snapshot: VoxelRegionStorage, coords: Array[Vector3i],
+		chunk_densities: Array[PackedByteArray], chunk_types: Array[PackedByteArray]) -> void:
+	for index in coords.size():
+		storage_snapshot.save_chunk(coords[index], chunk_densities[index], chunk_types[index])
 
 
 # Worker thread: must not touch members. The arrays hold the 3x3x3 chunks around the meshed chunk,
@@ -449,12 +534,51 @@ func _has_neighbourhood(coord: Vector3i) -> bool:
 
 
 func _get_chunk(coord: Vector3i) -> VoxelChunk:
-	if not _chunks.has(coord):
+	if _chunks.has(coord):
+		return _chunks[coord]
+	var chunk := _reclaim(coord)
+	if chunk == null and _storage_snapshot != null:
+		chunk = _storage_snapshot.load_chunk(coord)
+	if chunk == null:
 		if generator != null and procedural:
-			_chunks[coord] = generator.generate(coord)
+			chunk = generator.generate(coord)
 		else:
-			_chunks[coord] = VoxelChunk.new()
-	return _chunks[coord]
+			chunk = VoxelChunk.new()
+	_chunks[coord] = chunk
+	return chunk
+
+
+# An unloaded chunk whose save has not finished is taken back, not reloaded stale from storage.
+# Marked edited, since it may carry edits that a rebuild must not drop.
+func _reclaim(coord: Vector3i) -> VoxelChunk:
+	var chunk: VoxelChunk = _save_queue.get(coord, _saving.get(coord))
+	if chunk != null:
+		_save_queue.erase(coord)
+		_unsaved[coord] = true
+	return chunk
+
+
+# Writes unsaved chunks now: all, or only edited ones. Without storage it only warns.
+func _flush(edited_only: bool) -> void:
+	if _save_task != null:
+		WorkerThreadPool.wait_for_task_completion(_save_task.id)
+		_save_task = null
+		_saving.clear()
+	var coords: Array[Vector3i] = []
+	for coord in _unsaved:
+		if _unsaved[coord] or not edited_only:
+			coords.append(coord)
+	if _storage_snapshot == null:
+		if not coords.is_empty():
+			push_warning("VoxelTerrain: no storage directory selected; %d chunks were not saved."
+				% coords.size())
+		return
+	for coord in _save_queue:
+		_storage_snapshot.save_chunk(coord, _save_queue[coord].densities, _save_queue[coord].types)
+	_save_queue.clear()
+	for coord in coords:
+		_storage_snapshot.save_chunk(coord, _chunks[coord].densities, _chunks[coord].types)
+		_unsaved.erase(coord)
 
 
 # Chunks that get a mesh are [_mesh_begin(), _mesh_end()) per axis.
