@@ -1,18 +1,21 @@
 @tool
 class_name VoxelTerrain
 extends Node3D
-# OWNS:       The 3D chunk grid streamed around the camera: threaded generation and meshing, edits.
+# OWNS:       The 3D chunk grid, infinite (streamed around the camera) or contained: threaded
+#             generation and meshing, edits.
 # DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, WorkerThreadPool
 # INVARIANTS: An authored chunk is the same object in authored_chunks and _chunks, so edits land in
 #             the saved data; authored chunks override the generator (see D-17).
-# GOTCHAS:    @tool: everything is rebuilt in the editor when generator, its noise or chunk_extent
+# GOTCHAS:    @tool: everything is rebuilt in the editor when any export, the generator or its noise
 #             change. Chunk MeshInstance3Ds are internal children without an owner, so they are
 #             never saved into the scene. Without a generator, unauthored chunks are air. A chunk
 #             mesh reads samples one past its own on each side (INV-7), so remeshing pulls in
 #             neighbour chunk data, generating chunks just outside chunk_extent.
-#             Streaming (D-19): follows the editor camera of 3D viewport 0 in the editor and the
-#             current camera in game. Chunks leaving the range lose their mesh and, unless
-#             authored, their data.
+#             Contained worlds (D-20) store no chunks outside world_size; meshing reads air
+#             there (outside_faces) or repeats the boundary samples; set_voxel ignores them.
+#             Streaming (D-19, infinite only): follows the editor camera of 3D viewport 0 in the
+#             editor and the current camera in game. Chunks leaving the range lose their mesh and,
+#             unless authored, their data.
 #             Threading (D-18): _generate_chunk and _mesh_chunk run on worker threads and must not
 #             touch members; they get a generator snapshot and copy-on-write sample arrays instead.
 #             Tasks call methods on this node, so PREDELETE waits for them. Results are applied in
@@ -28,10 +31,35 @@ extends Node3D
 			generator.changed.connect(_queue_rebuild)
 		_queue_rebuild()
 
-# Chunks in [camera chunk - chunk_extent, camera chunk + chunk_extent) per axis get meshes.
+# Off: a contained world of world_size chunks from this node's origin along +x, +y, +z.
+@export var infinite := true:
+	set(value):
+		infinite = value
+		_queue_rebuild()
+
+# Off: unauthored chunks are air, for hand-authored terrain.
+@export var procedural := true:
+	set(value):
+		procedural = value
+		_queue_rebuild()
+
+# Infinite only: chunks in [camera chunk - chunk_extent, camera chunk + chunk_extent) get meshes.
 @export var chunk_extent := Vector3i(2, 2, 2):
 	set(value):
 		chunk_extent = value
+		_queue_rebuild()
+
+# Contained only.
+@export var world_size := Vector3i(4, 2, 4):
+	set(value):
+		world_size = value
+		_queue_rebuild()
+
+# Contained only: closes the surface where solid voxels touch the world boundary. Off leaves the
+# terrain cut open there.
+@export var outside_faces := true:
+	set(value):
+		outside_faces = value
 		_queue_rebuild()
 
 # Chunks changed through set_voxel, saved with the scene.
@@ -40,7 +68,7 @@ extends Node3D
 var _chunks: Dictionary[Vector3i, VoxelChunk] = {}
 # A null value marks a chunk that was meshed but has no surface.
 var _meshes: Dictionary[Vector3i, MeshInstance3D] = {}
-# Chunk the camera is in; the streamed range is centred on it.
+# Infinite only: chunk the camera is in; the streamed range is centred on it.
 var _center := Vector3i.ZERO
 # Read by worker threads instead of generator, so inspector edits never race a running task.
 var _generator_snapshot: VoxelGenerator
@@ -54,6 +82,8 @@ var _mesh_tasks: Dictionary[Vector3i, ChunkTask] = {}
 var _abandoned_tasks: Array[ChunkTask] = []
 var _rebuild_queued := false
 var _material := StandardMaterial3D.new()
+# Stands in for chunks outside a contained world.
+var _air_chunk := VoxelChunk.new()
 
 
 # The worker writes result; the main thread reads it only after the task completes. cancelled is
@@ -74,10 +104,11 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	var center := _viewer_chunk()
-	if center != _center:
-		_center = center
-		_refresh()
+	if infinite:
+		var center := _viewer_chunk()
+		if center != _center:
+			_center = center
+			_refresh()
 	_finish_tasks()
 	_start_tasks()
 
@@ -94,6 +125,9 @@ func _notification(what: int) -> void:
 
 func set_voxel(world: Vector3i, density: float, type: VoxelChunk.Type) -> void:
 	var coord := _chunk_coord(world)
+	# A contained world has no voxels outside its chunks; brushes reaching past the edge are clipped.
+	if _is_outside_world(coord):
+		return
 	var chunk := _get_chunk(coord)
 	authored_chunks[coord] = chunk
 	var index := VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)
@@ -107,7 +141,7 @@ func set_voxel(world: Vector3i, density: float, type: VoxelChunk.Type) -> void:
 				var in_padded_grid := padded.x >= 0 and padded.y >= 0 and padded.z >= 0 \
 					and padded.x < MarchingCubes.PADDED and padded.y < MarchingCubes.PADDED \
 					and padded.z < MarchingCubes.PADDED
-				if in_padded_grid and _is_in_range(neighbour, 0):
+				if in_padded_grid and _is_meshed(neighbour):
 					_mesh_queue[neighbour] = true
 
 
@@ -129,7 +163,7 @@ func _rebuild() -> void:
 	_chunks.clear()
 	_chunks.merge(authored_chunks)
 	_generator_snapshot = null
-	if generator != null:
+	if generator != null and procedural:
 		_generator_snapshot = generator.duplicate(true) as VoxelGenerator
 	# Existing meshes stay visible until their replacement arrives, so a rebuild does not flicker.
 	for coord in _meshes:
@@ -137,37 +171,39 @@ func _rebuild() -> void:
 	_refresh()
 
 
-# Unloads what left the range around _center and queues what entered it, nearest first.
+# Unloads what left the range and queues what entered it, nearest to _center first.
 func _refresh() -> void:
 	for coord in _meshes.keys():
-		if not _is_in_range(coord, 0):
+		if not _is_meshed(coord):
 			if _meshes[coord] != null:
 				_meshes[coord].queue_free()
 			_meshes.erase(coord)
 	for coord in _mesh_tasks.keys():
-		if not _is_in_range(coord, 0):
+		if not _is_meshed(coord):
 			_cancel(_mesh_tasks[coord])
 			_mesh_tasks.erase(coord)
-	# One chunk past the extent on each side: meshes read their neighbours' samples (INV-7).
 	for coord in _generation_tasks.keys():
-		if not _is_in_range(coord, 1):
+		if not _is_loaded(coord):
 			_cancel(_generation_tasks[coord])
 			_generation_tasks.erase(coord)
 	for coord in _chunks.keys():
-		if not _is_in_range(coord, 1) and not authored_chunks.has(coord):
+		if not _is_loaded(coord) and not authored_chunks.has(coord):
 			_chunks.erase(coord)
-	var mesh_coords := _mesh_queue.keys().filter(func(coord: Vector3i) -> bool:
-		return _is_in_range(coord, 0))
+	var mesh_coords := _mesh_queue.keys().filter(_is_meshed)
 	_generation_queue.clear()
-	for z in range(_center.z - chunk_extent.z - 1, _center.z + chunk_extent.z + 1):
-		for y in range(_center.y - chunk_extent.y - 1, _center.y + chunk_extent.y + 1):
-			for x in range(_center.x - chunk_extent.x - 1, _center.x + chunk_extent.x + 1):
+	# Covers both ranges: loaded reaches at most one chunk past the meshed range.
+	var begin := _mesh_begin() - Vector3i.ONE
+	var end := _mesh_end() + Vector3i.ONE
+	for z in range(begin.z, end.z):
+		for y in range(begin.y, end.y):
+			for x in range(begin.x, end.x):
 				var coord := Vector3i(x, y, z)
-				if not _chunks.has(coord) and not _generation_tasks.has(coord):
+				var needs_data := not _chunks.has(coord) and not _generation_tasks.has(coord)
+				if needs_data and _is_loaded(coord):
 					_generation_queue.append(coord)
 				var needs_mesh := not _meshes.has(coord) and not _mesh_tasks.has(coord) \
 					and not _mesh_queue.has(coord)
-				if needs_mesh and _is_in_range(coord, 0):
+				if needs_mesh and _is_meshed(coord):
 					mesh_coords.append(coord)
 	_generation_queue.sort_custom(_is_nearer)
 	mesh_coords.sort_custom(_is_nearer)
@@ -218,11 +254,21 @@ func _start_tasks() -> void:
 		for z in range(-1, 2):
 			for y in range(-1, 2):
 				for x in range(-1, 2):
-					var chunk: VoxelChunk = _chunks[coord + Vector3i(x, y, z)]
+					var neighbour := coord + Vector3i(x, y, z)
+					var chunk: VoxelChunk = _air_chunk if _is_outside_world(neighbour) else _chunks[neighbour]
 					chunk_densities.append(chunk.densities)
 					chunk_types.append(chunk.types)
+		# Chunk-local sample bounds the gather clamps to; the default never clamps.
+		var sample_min := -Vector3i.ONE
+		var sample_max := Vector3i.ONE * (VoxelChunk.SIZE + 1)
+		if not infinite and not outside_faces:
+			# Repeating the boundary samples outward leaves no sign change, so no surface, there.
+			var origin := coord * VoxelChunk.SIZE
+			sample_min = sample_min.max(-origin)
+			sample_max = sample_max.min(world_size * VoxelChunk.SIZE - Vector3i.ONE - origin)
 		var task := ChunkTask.new()
-		task.id = WorkerThreadPool.add_task(_mesh_chunk.bind(task, chunk_densities, chunk_types))
+		task.id = WorkerThreadPool.add_task(
+			_mesh_chunk.bind(task, chunk_densities, chunk_types, sample_min, sample_max))
 		_mesh_tasks[coord] = task
 		free_slots -= 1
 
@@ -253,7 +299,7 @@ func _generate_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator, coord:
 # Worker thread: must not touch members. The arrays hold the 3x3x3 chunks around the meshed chunk,
 # x fastest; they are copy-on-write snapshots, so set_voxel on the main thread cannot change them.
 func _mesh_chunk(task: ChunkTask, chunk_densities: Array[PackedFloat32Array],
-		chunk_types: Array[PackedByteArray]) -> void:
+		chunk_types: Array[PackedByteArray], sample_min: Vector3i, sample_max: Vector3i) -> void:
 	if task.cancelled:
 		return
 	var densities := PackedFloat32Array()
@@ -263,11 +309,11 @@ func _mesh_chunk(task: ChunkTask, chunk_densities: Array[PackedFloat32Array],
 	for z in range(-1, VoxelChunk.SIZE + 2):
 		for y in range(-1, VoxelChunk.SIZE + 2):
 			for x in range(-1, VoxelChunk.SIZE + 2):
-				var local := Vector3i(x, y, z)
+				var local := Vector3i(x, y, z).clamp(sample_min, sample_max)
 				var offset := _chunk_coord(local)
 				var neighbour := (offset.x + 1) + (offset.y + 1) * 3 + (offset.z + 1) * 9
 				var index := VoxelChunk.sample_index(local - offset * VoxelChunk.SIZE)
-				var padded_index := MarchingCubes.padded_index(local)
+				var padded_index := MarchingCubes.padded_index(Vector3i(x, y, z))
 				densities[padded_index] = chunk_densities[neighbour][index]
 				types[padded_index] = chunk_types[neighbour][index]
 	if task.cancelled:
@@ -295,23 +341,52 @@ func _has_neighbourhood(coord: Vector3i) -> bool:
 	for z in range(-1, 2):
 		for y in range(-1, 2):
 			for x in range(-1, 2):
-				if not _chunks.has(coord + Vector3i(x, y, z)):
+				var neighbour := coord + Vector3i(x, y, z)
+				if not _chunks.has(neighbour) and not _is_outside_world(neighbour):
 					return false
 	return true
 
 
 func _get_chunk(coord: Vector3i) -> VoxelChunk:
 	if not _chunks.has(coord):
-		_chunks[coord] = generator.generate(coord) if generator != null else VoxelChunk.new()
+		if generator != null and procedural:
+			_chunks[coord] = generator.generate(coord)
+		else:
+			_chunks[coord] = VoxelChunk.new()
 	return _chunks[coord]
 
 
-# margin widens the range by that many chunks on every side.
-func _is_in_range(coord: Vector3i, margin: int) -> bool:
-	var offset := coord - _center
-	return offset.x >= -chunk_extent.x - margin and offset.x < chunk_extent.x + margin \
-		and offset.y >= -chunk_extent.y - margin and offset.y < chunk_extent.y + margin \
-		and offset.z >= -chunk_extent.z - margin and offset.z < chunk_extent.z + margin
+# Chunks that get a mesh are [_mesh_begin(), _mesh_end()) per axis.
+func _mesh_begin() -> Vector3i:
+	if infinite:
+		return _center - chunk_extent
+	# The closing faces on the low sides lie in the last cells of chunk -1 (cells span sample n..n+1).
+	return -Vector3i.ONE if outside_faces else Vector3i.ZERO
+
+
+func _mesh_end() -> Vector3i:
+	return _center + chunk_extent if infinite else world_size
+
+
+func _is_meshed(coord: Vector3i) -> bool:
+	return _is_in_box(coord, _mesh_begin(), _mesh_end())
+
+
+# Chunks whose data is kept in _chunks.
+func _is_loaded(coord: Vector3i) -> bool:
+	if infinite:
+		# One chunk past the meshed range: meshes read their neighbours' samples (INV-7).
+		return _is_in_box(coord, _mesh_begin() - Vector3i.ONE, _mesh_end() + Vector3i.ONE)
+	return _is_in_box(coord, Vector3i.ZERO, world_size)
+
+
+func _is_outside_world(coord: Vector3i) -> bool:
+	return not infinite and not _is_in_box(coord, Vector3i.ZERO, world_size)
+
+
+func _is_in_box(coord: Vector3i, begin: Vector3i, end: Vector3i) -> bool:
+	return coord.x >= begin.x and coord.x < end.x and coord.y >= begin.y and coord.y < end.y \
+		and coord.z >= begin.z and coord.z < end.z
 
 
 func _is_nearer(a: Vector3i, b: Vector3i) -> bool:

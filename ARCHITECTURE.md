@@ -19,7 +19,7 @@ Target: Windows, D3D12
 | M-4 | volumetric_sky/shaders/ | Compute passes: LUTs, noise, clouds, composite | M-1 dispatch | active |
 | M-5 | volumetric_sky/demo/ | Reference scene wiring M-1..M-3, M-6 | M-1, M-2, M-3, M-6 | active |
 | M-6 | volumetric_sky/cloud_shadow.gdshaderinc | Cloud shadow, cloud AO, drop-in light() for materials | shader globals from M-1, M-2 | active |
-| M-7 | voxel/voxel_terrain.gd | Camera-streamed 3D chunk grid, threaded meshing, edits | M-8, M-9, M-10 | active |
+| M-7 | voxel/voxel_terrain.gd | Streamed or contained chunk grid, threaded meshing, edits | M-8, M-9, M-10 | active |
 | M-8 | voxel/voxel_chunk.gd | Per-chunk density and voxel type samples | none | active |
 | M-9 | voxel/voxel_generator.gd | Procedural chunk density and type | M-8, FastNoiseLite | active |
 | M-10 | voxel/marching_cubes.gd | Padded density grid to chunk ArrayMesh | M-8 | active |
@@ -73,6 +73,7 @@ D-16 2026-10-28: Performance (1080p viewport 2.7-3.0 -> 1.6-1.9 ms, RTX 3070): a
 D-17 2026-10-28: Voxel content = generator output overridden per chunk by authored chunks (VoxelTerrain.authored_chunks, saved with the scene); set_voxel turns a chunk authored. Density > 0 is solid, one sample per world unit, 16^3 per chunk; types colour vertices (solid edge endpoint) via one vertex-colour material.
 D-18 2026-10-28: Chunk generation and meshing run as WorkerThreadPool tasks (pool sized to the CPU by Godot), at most OS.get_processor_count() in flight so rebuilds drop queued work and deletion waits briefly. Workers get a generator duplicate and copy-on-write sample arrays, never live state; results are applied in _process. ArrayMesh is built on the worker; nodes are added on the main thread.
 D-19 2026-10-28: chunk_extent is a range around the camera's chunk, not the origin. Leaving chunks lose mesh and (unless authored) data; queues are sorted nearest-first on every centre change; out-of-range tasks are cancelled by a flag polled between worker stages (no mid-loop abort, so M-9/M-10 stay untouched).
+D-20 2026-10-28: VoxelTerrain toggles infinite (D-19 streaming) vs contained (world_size chunks from the node origin, no streaming) and procedural (off = unauthored chunks are air). Contained worlds keep no data outside; outside_faces reads air there and also meshes chunk -1 on the low sides (their last cells hold the closing faces); off clamps the gather to the boundary samples so the terrain is cut open. set_voxel outside a contained world is ignored.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).
