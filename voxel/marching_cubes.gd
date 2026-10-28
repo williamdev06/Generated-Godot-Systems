@@ -298,7 +298,7 @@ const TRIANGLES := [
 
 # Returns null when the chunk has no surface. Every vertex carries its triangle's three voxel types
 # (CUSTOM0 rgb, in triangle corner order) and its barycentric weight for them (COLOR), which
-# voxel_terrain.gdshader blends by (D-21).
+# voxel_terrain.gdshader blends by (D-23).
 static func build_mesh(densities: PackedByteArray, types: PackedByteArray) -> ArrayMesh:
 	var vertices := PackedVector3Array()
 	var normals := PackedVector3Array()
@@ -338,7 +338,8 @@ static func build_mesh(densities: PackedByteArray, types: PackedByteArray) -> Ar
 							edge_vertices[key] = vertices.size()
 							vertices.append(start.lerp(end, weight))
 							# Density rises into the solid, so the outward normal is the negative gradient.
-							var gradient := _gradient(densities, start_index).lerp(_gradient(densities, end_index), weight)
+							var gradient := _gradient(densities, start_index).lerp(
+								_gradient(densities, end_index), weight)
 							normals.append(-gradient.normalized())
 							var solid_type := types[start_index if start_density > VoxelChunk.ISO else end_index]
 							weights.append(BARYCENTRIC[0])

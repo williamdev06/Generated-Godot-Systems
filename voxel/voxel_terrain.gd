@@ -6,7 +6,7 @@ extends Node3D
 # DEPENDS:    VoxelChunk, VoxelGenerator, MarchingCubes, VoxelType, voxel_terrain.gdshader,
 #             WorkerThreadPool
 # INVARIANTS: An authored chunk is the same object in authored_chunks and _chunks, so edits land in
-#             the saved data; authored chunks override the generator (see D-17, D-21).
+#             the saved data; authored chunks override the generator (see D-17, D-23).
 # GOTCHAS:    @tool: everything is rebuilt in the editor when any export, the generator or its noise
 #             change. Chunk MeshInstance3Ds are internal children without an owner, so they are
 #             never saved into the scene. Without a generator, unauthored chunks are air. A chunk
@@ -64,7 +64,8 @@ extends Node3D
 		outside_faces = value
 		_queue_rebuild()
 
-# A chunk's type byte indexes this; the shader texture layer of each type. Changing it never remeshes.
+# A chunk's type byte indexes this; also the shader texture layer of each type. Changing it never
+# remeshes.
 @export var voxel_types: Array[VoxelType] = []:
 	set(value):
 		for voxel_type in voxel_types:
@@ -164,6 +165,31 @@ func set_voxel(world: Vector3i, density: float, type: int) -> void:
 					and padded.z < MarchingCubes.PADDED
 				if in_padded_grid and _is_meshed(neighbour):
 					_mesh_queue[neighbour] = true
+
+
+# set_voxel for each index; the editor's undo/redo replays strokes through this.
+func set_voxels(worlds: Array[Vector3i], densities: PackedFloat32Array,
+		types: PackedByteArray) -> void:
+	for index in worlds.size():
+		set_voxel(worlds[index], densities[index], types[index])
+
+
+# 0.0..1.0. Chunks without data (not generated yet, unloaded, outside a contained world, or all
+# air) read as air.
+func get_density(world: Vector3i) -> float:
+	var coord := _chunk_coord(world)
+	var chunk: VoxelChunk = _chunks.get(coord)
+	if chunk == null or chunk.densities.is_empty():
+		return 0.0
+	return chunk.densities[VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)] / 255.0
+
+
+func get_type(world: Vector3i) -> int:
+	var coord := _chunk_coord(world)
+	var chunk: VoxelChunk = _chunks.get(coord)
+	if chunk == null or chunk.types.is_empty():
+		return 0
+	return chunk.types[VoxelChunk.sample_index(world - coord * VoxelChunk.SIZE)]
 
 
 func _queue_rebuild() -> void:
