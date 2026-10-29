@@ -41,7 +41,7 @@ extends Node3D
 #             unloads them. Before the first (deferred) rebuild they see no storage or model, so
 #             spawn queries from _ready must be deferred. Trilinear density matches the mesh along
 #             cell edges only.
-#             LOD (D-29..D-31, infinite with lod_extents only): coarse chunks hold no data; each mesh
+#             LOD (D-32..D-34, infinite with lod_extents only): coarse chunks hold no data; each mesh
 #             task samples the generator, overridden by loaded LOD 0 chunks within reach (INV-11),
 #             and builds transition cells on all 6 faces. The shader shows a face's transition only
 #             while transition_mask says the space across it is shown one LOD finer. Coarse chunks
@@ -78,7 +78,7 @@ extends Node3D
 # Infinite only: coarse rings around the chunk_extent box, one per entry, each at half the
 # resolution of the one inside it (LOD n chunks are 2^n times wider). An entry is the ring's half
 # size in its own chunks. With rings, every extent (chunk_extent too) is raised to an even count of
-# at least half the extent inside + 2, so rings nest on whole chunks (D-29). Empty: no LOD.
+# at least half the extent inside + 2, so rings nest on whole chunks (D-32). Empty: no LOD.
 @export var lod_extents: Array[Vector3i] = []:
 	set(value):
 		lod_extents = value
@@ -875,7 +875,7 @@ func _retire_outgoing() -> void:
 
 
 # True when every chunk of the current layout inside key's space has a mesh result, with or
-# without surface. Boxes nest on whole chunks of the next LOD (D-29), so key's space is either
+# without surface. Boxes nest on whole chunks of the next LOD (D-32), so key's space is either
 # inside one coarser layout chunk or splits into its 8 children.
 func _is_covered(key: Vector4i) -> bool:
 	if _is_target(key):
@@ -1184,7 +1184,7 @@ func _world_size() -> Vector3i:
 	return model.world_size if model != null else Vector3i.ZERO
 
 
-# Box half sizes per LOD, [0] for LOD 0, made to nest (D-29): even, so each box is whole chunks of
+# Box half sizes per LOD, [0] for LOD 0, made to nest (D-32): even, so each box is whole chunks of
 # the next LOD, and at least half the box inside + 2, so the next LOD's box keeps a whole chunk
 # around it wherever the camera is and chunks only border chunks one LOD apart.
 func _ring_extents() -> Array[Vector3i]:

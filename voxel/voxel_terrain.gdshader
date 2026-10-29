@@ -1,5 +1,5 @@
 // OWNS:       Chunk surface albedo: per voxel type texture, triplanar, blended across type borders.
-//             Transvoxel secondary positions and transition faces of coarse LOD chunks (D-30).
+//             Transvoxel secondary positions and transition faces of coarse LOD chunks (D-33).
 // DEPENDS:    VoxelTerrain: binds type_textures (one layer per get_voxel_types() entry), sets the
 //             transition_mask instance uniform. MarchingCubes vertex layout: CUSTOM0 rgb = triangle
 //             corner types / 255, CUSTOM0 a = transition flags / 255, COLOR rgb = barycentric weight.

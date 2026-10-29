@@ -14,7 +14,7 @@ extends RefCounted
 #             vertex used only by mixed-type triangles stays in the buffer unreferenced.
 #             Transition vertices are copies, not shared with regular cells: CUSTOM0 alpha marks
 #             them (face + 1, plus FIXED on the full resolution face) so the shader can drop the
-#             faces whose neighbour is not finer and move the rest (D-30).
+#             faces whose neighbour is not finer and move the rest (D-33).
 
 const PADDED := VoxelChunk.SIZE + 3
 # Fine samples along a face in a slab: -1..2 * SIZE + 1, one past each end for gradients.

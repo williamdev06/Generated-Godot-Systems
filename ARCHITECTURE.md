@@ -23,7 +23,7 @@ Target: Windows, D3D12
 | M-8 | voxel/voxel_chunk.gd | Per-chunk byte samples and their saved encoding | none | active |
 | M-9 | voxel/voxel_generator.gd | Procedural density and type for chunks and grids | M-8, FastNoiseLite | active |
 | M-10 | voxel/marching_cubes.gd | Padded grid and face slabs to chunk mesh arrays | M-8, M-18 | active |
-| M-11 | voxel/demo/ | Reference scene for M-7 with M-9 | M-7, M-9, M-13 | active |
+| M-11 | voxel/demo/ | Reference scene and first-person player for M-7 | M-7, M-9, M-13, physics | active |
 | M-12 | addons/voxel_editor/ | Editor sculpt and voxel tools for M-7 | M-7, M-8, EditorPlugin | active |
 | M-13 | voxel/voxel_type.gd | Per voxel type texture (Resource) | none | active |
 | M-14 | voxel/voxel_terrain.gdshader | Triplanar per-type texturing, Transvoxel transition vertex placement | M-7 texture array and transition_mask, M-10 vertex layout | active |
@@ -59,8 +59,9 @@ M-12 -> M-7: get_density (0..1)/get_type reads (missing or empty chunks read as 
 M-7 -> physics: per-chunk StaticBody3D (collision_layer) + ConcavePolygonShape3D of the mesh triangles (faces unrolled on the worker); replaced with the mesh in _apply_mesh
 callers -> M-7: sample_density / get_normal / raycast / push_out (terrain-local, main thread); load or generate missing chunks synchronously
 EditorUndoRedoManager -> M-7: set_voxels(worlds, densities, types) with a stroke's before/after values; on undo/redo
+M-11 player -> M-7: set_voxel (single sample, editor voxel tool pick) on left/right click; raycast once at spawn; push_out every physics frame
 M-9 -> M-7: VoxelGenerator.generate_grid(origin, step, size) -> [densities, types] on a worker (snapshot generator); per coarse chunk mesh task, for its padded grid (step 2^lod) and 6 face slabs (half step), then overridden by loaded LOD 0 chunks within reach (INV-11)
-M-7 -> M-10: MarchingCubes.build_arrays(padded densities, types, slab densities, slab types) -> regular + transition cell arrays, on a worker; per coarse chunk in a ring (D-29)
+M-7 -> M-10: MarchingCubes.build_arrays(padded densities, types, slab densities, slab types) -> regular + transition cell arrays, on a worker; per coarse chunk in a ring (D-32)
 M-10 -> M-14: per vertex CUSTOM0 a = transition flags (face + 1, FIXED on the full resolution face; 0 on regular vertices)
 M-7 -> M-14: instance uniform transition_mask per coarse MeshInstance3D (faces whose space is shown one LOD finer); end of frame when shown chunks next to it change
 
@@ -107,9 +108,12 @@ D-25 2026-10-28: Infinite worlds persist every generated or edited chunk through
 D-26 2026-10-28: Contained worlds save every chunk into a VoxelModel resource: built into the scene when none is assigned (auto-created, so the inspector's Save As / Make Unique turn it into an asset or back), or a shared asset written on editor scene save. Model and region files store the same VoxelChunk.encode payloads (INV-9) behind a VoxelStorage base class; contained edits reach the model every frame so duplicates capture them; closing without saving discards contained changes. Region writes use the first gap that fits and truncate the tail, so files no longer only grow.
 D-27 2026-10-28: A VoxelModel owns its contained world's world_size and voxel_types (moved off VoxelTerrain for contained worlds) so a reused model asset brings its size and palette; VoxelTerrain.voxel_types now applies to infinite worlds only and callers use get_voxel_types().
 D-28 2026-10-28: Two collision paths. Trimesh per chunk (exact match to the mesh) for physics bodies and visuals; density field queries (trilinear, no physics) for characters, items, unstuck and spawn, since they work before meshing and can push out of solid. Faces come from MarchingCubes arrays, not the ArrayMesh (GPU readback). Editor picking stays on D-21.
-D-29 2026-10-29: LOD layout is nested clipmap boxes for infinite worlds: chunk_extent for LOD 0, then one exported half size per coarse ring (lod_extents, user-chosen rather than profiled). Extents are raised to even and >= half the inner + 2, and boxes centre on the camera snapped to the next LOD's chunks, so rings nest on whole chunks and neighbours differ by at most one LOD. Contained worlds have no LOD.
-D-30 2026-10-29: Seams use Transvoxel (Lengyel's tables, MIT), which replaced the Bourke table for all chunks so transition faces match LOD 0. Coarse chunks always build transition cells on all 6 faces; the shader collapses faces whose mask bit is clear and moves the outer cell layer by Lengyel's secondary position (width 0.5 cell, tangent-projected). Chosen over skirts (overhangs poke through) and over remeshing on mask change (the mask switches the same frame a handoff finishes).
-D-31 2026-10-29: Coarse chunks store no data: generator grids at step 2^lod, band scaled by step, overridden by loaded LOD 0 chunks within reach. Edits and saved terrain beyond the loaded ring do not show at coarse LODs (stored coarse copies deferred). Chunks a layout change drops stay visible until everything in their space has a mesh result; new results stay hidden until then.
+D-29 2026-10-29: Checkerboard clouds (cloud_checkerboard, default on): clouds_raymarch traces one pixel per 2x2 block in Bayer order (cloud_current/cloud_distance are block-sized); clouds_temporal rebuilds full-res history, untraced pixels = clamped reprojected history, traced pixels use history share amount^4 so convergence matches. Raymarch 0.39-0.79 -> 0.12-0.22 ms at 1080p.
+D-30 2026-10-29: Inside the cloud layer the view march spaces samples exponentially from the camera (march_distance_km, 0.1 km near scale) instead of quadratically over the span, so near steps don't scale with the up-to-max-distance horizontal span. Outside the layer stays quadratic.
+D-31 2026-10-29: The demo player is a CharacterBody3D colliding with the chunk trimeshes, not a density-query controller (D-28 named density for characters), because move_and_slide gives slopes/floor/jump for free. Density push_out only keeps it out of solid where chunks are not meshed yet.
+D-32 2026-10-29: LOD layout is nested clipmap boxes for infinite worlds: chunk_extent for LOD 0, then one exported half size per coarse ring (lod_extents, user-chosen rather than profiled). Extents are raised to even and >= half the inner + 2, and boxes centre on the camera snapped to the next LOD's chunks, so rings nest on whole chunks and neighbours differ by at most one LOD. Contained worlds have no LOD.
+D-33 2026-10-29: Seams use Transvoxel (Lengyel's tables, MIT), which replaced the Bourke table for all chunks so transition faces match LOD 0. Coarse chunks always build transition cells on all 6 faces; the shader collapses faces whose mask bit is clear and moves the outer cell layer by Lengyel's secondary position (width 0.5 cell, tangent-projected). Chosen over skirts (overhangs poke through) and over remeshing on mask change (the mask switches the same frame a handoff finishes).
+D-34 2026-10-29: Coarse chunks store no data: generator grids at step 2^lod, band scaled by step, overridden by loaded LOD 0 chunks within reach. Edits and saved terrain beyond the loaded ring do not show at coarse LODs (stored coarse copies deferred). Chunks a layout change drops stay visible until everything in their space has a mesh result; new results stay hidden until then.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).
@@ -117,6 +121,6 @@ D-31 2026-10-29: Coarse chunks store no data: generator grids at step 2^lod, ban
 2026-10-28: Per-viewport froxel textures (D-10) are freed only on resize or effect deletion; closed editor viewports leak theirs until then.
 2026-10-28: Between shadow map refreshes, Beer lookups use the current sun direction with the stored frame; a fast-moving sun shows up to shadow_map_update_interval frames of mismatch.
 2026-10-28: Noise stretch constants (noise_gen.glsl 0.75/0.15, weather_gen.glsl 0.373/0.239/0.258) come from measured percentiles; re-measure if the noise functions change.
-2026-10-29: Coarse LODs ignore edits and saved chunks beyond the loaded ring; after a generator change, explored LOD 0 keeps the old terrain while coarse rings show the new (D-31).
+2026-10-29: Coarse LODs ignore edits and saved chunks beyond the loaded ring; after a generator change, explored LOD 0 keeps the old terrain while coarse rings show the new (D-34).
 2026-10-29: Coarse chunks sample all 6 transition slabs (about 3x the generator calls of their padded grid) whether or not a face is ever active; unprofiled.
 2026-10-29: transition_mask checks one finer chunk per face; while only part of a finer neighbour is shown (handoff in progress), that face can crack for a few frames.

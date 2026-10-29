@@ -101,6 +101,14 @@ float optical_depth_to_sun(vec3 planet_position, vec3 noise_position, vec3 sun_d
 	return optical_depth;
 }
 
+// March fraction 0..1 -> km from the ray start. From outside the layer, quadratic over the span. From
+// inside, exponential from the camera: the span reaches CLOUD_MAX_DISTANCE_KM on horizontal rays, so
+// quadratic spacing there put the second sample hundreds of metres out and near steps varied with pitch.
+float march_distance_km(float fraction, float span_km, bool inside_layer) {
+	const float NEAR_SCALE_KM = 0.1; // steps grow roughly in proportion to distance beyond this
+	return inside_layer ? NEAR_SCALE_KM * (pow(1.0 + span_km / NEAR_SCALE_KM, fraction) - 1.0) : span_km * fraction * fraction;
+}
+
 CloudSample march_clouds(vec3 direction, float max_distance_km, float jitter, int step_count, int light_step_count, bool include_detail) {
 	CloudSample result = CloudSample(vec3(0.0), 1.0, min(max_distance_km, CLOUD_MAX_DISTANCE_KM));
 	float altitude = params.camera_position.w;
@@ -139,24 +147,24 @@ CloudSample march_clouds(vec3 direction, float max_distance_km, float jitter, in
 	vec3 ground_sun_transmittance = textureLod(transmittance_lut, transmittance_uv(GROUND_RADIUS_KM, sun_direction.y), 0.0).rgb;
 	vec3 ground_ambient = params.sun_illuminance.rgb * ground_sun_transmittance * max(sun_direction.y, 0.0) * GROUND_ALBEDO / PI;
 	float span_km = end_km - start_km;
+	bool inside_layer = altitude >= CLOUD_BOTTOM_KM && altitude <= CLOUD_TOP_KM;
 	float weighted_distance_km = 0.0;
 	float total_weight = 0.0;
 	float detail_lod_distance_km = params.cloud_quality.w;
 
-	// Samples are placed at fraction^2 along the span (quadratic spacing: short steps near the ray start,
-	// where fly-through detail matters). After two empty samples, steps grow EMPTY_STEP_SCALE times;
-	// a big step that lands in cloud backs up to just past the last empty sample and resumes fine steps.
+	// Samples sit on a grid of fine steps in march fraction, offset by the jitter. From the third empty
+	// sample in a row, steps grow EMPTY_STEP_SCALE times (staying on the grid); a big step that lands in
+	// cloud backs up to just past the last empty sample and resumes fine steps.
 	const float EMPTY_STEP_SCALE = 3.0;
 	float fine_step = 1.0 / float(step_count);
 	float fraction = jitter * fine_step;
 	float previous_fraction = 0.0;
 	int empty_samples = 0;
-	// Fine steps alone finish in step_count iterations; each refinement after a big step costs one more.
-	for (int iteration = 0; iteration < step_count + 16 && fraction < 1.0; iteration++) {
-		bool skipping = empty_samples >= 2;
-		float next_fraction = min(fraction + (skipping ? fine_step * EMPTY_STEP_SCALE : fine_step), 1.0);
-		float distance_km = start_km + span_km * fraction * fraction;
-		float step_km = span_km * (next_fraction * next_fraction - fraction * fraction);
+	bool big_step = false;
+	// At most step_count grid samples, plus one wasted sample per big step that lands in cloud; each of
+	// those needs three fine empty samples first. A lower cap truncated rays through broken cloud.
+	for (int iteration = 0; iteration < step_count + step_count / 3 + 1 && fraction < 1.0; iteration++) {
+		float distance_km = start_km + march_distance_km(fraction, span_km, inside_layer);
 		vec3 planet_position = camera_planet + direction * distance_km;
 		float sample_radius = length(planet_position);
 		float altitude_km = sample_radius - GROUND_RADIUS_KM;
@@ -167,20 +175,23 @@ CloudSample march_clouds(vec3 direction, float max_distance_km, float jitter, in
 		float base = height_fraction < 0.0 || height_fraction > 1.0 ? 0.0 : cloud_base_density(noise_position, height_fraction, weather);
 		if (base <= 0.0) {
 			empty_samples++;
+			big_step = empty_samples >= 3;
 			previous_fraction = fraction;
-			fraction = next_fraction;
-			continue;
-		}
-		if (skipping) {
-			empty_samples = 0;
-			fraction = previous_fraction + fine_step;
+			fraction = min(fraction + (big_step ? fine_step * EMPTY_STEP_SCALE : fine_step), 1.0);
 			continue;
 		}
 		empty_samples = 0;
+		// Only a big step backs up; a cloud reached by a fine step is integrated straight away.
+		if (big_step) {
+			big_step = false;
+			fraction = previous_fraction + fine_step;
+			continue;
+		}
+		float next_fraction = min(fraction + fine_step, 1.0);
+		float step_km = march_distance_km(next_fraction, span_km, inside_layer) - march_distance_km(fraction, span_km, inside_layer);
 		// Detail erosion fades out toward detail_lod_distance_km and is skipped beyond it.
 		float erosion_scale = include_detail ? 1.0 - smoothstep(0.7 * detail_lod_distance_km, detail_lod_distance_km, distance_km) : 0.0;
 		float extinction = (erosion_scale > 0.0 ? erode_cloud_density(base, noise_position, height_fraction, erosion_scale) : base) * params.cloud_settings.y;
-		previous_fraction = fraction;
 		fraction = next_fraction;
 		if (extinction <= 0.0) {
 			continue;
