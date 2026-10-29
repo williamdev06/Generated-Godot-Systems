@@ -11,6 +11,7 @@ config_version=5
 [application]
 
 config/name="AI-Content"
+run/main_scene="uid://cxu1cawi3jk1o"
 config/features=PackedStringArray("4.7", "Forward Plus")
 config/icon="res://icon.svg"
 
