@@ -41,12 +41,15 @@ extends Node3D
 #             unloads them. Before the first (deferred) rebuild they see no storage or model, so
 #             spawn queries from _ready must be deferred. Trilinear density matches the mesh along
 #             cell edges only.
-#             LOD (D-32..D-34, infinite with lod_extents only): coarse chunks hold no data; each mesh
-#             task samples the generator, overridden by loaded LOD 0 chunks within reach (INV-11),
-#             and builds transition cells on all 6 faces. The shader shows a face's transition only
-#             while transition_mask says the space across it is shown one LOD finer. Coarse chunks
-#             have no collision. A layout change keeps the chunks it dropped (_outgoing) visible
-#             until everything replacing them has a mesh result, hiding those results meanwhile.
+#             LOD (D-32..D-36, with lod_extents only): coarse chunks hold no data; each mesh task
+#             samples the generator, then the stored coarse copies (infinite), then in-memory LOD 0
+#             chunks within reach (INV-11, INV-13). Contained worlds keep every chunk loaded, so
+#             their coarse chunks read only those. Transition cells are built on the faces that
+#             border the finer box; the shader shows one only while transition_mask says the space
+#             across it is shown one LOD finer. Coarse chunks have no collision, so contained worlds
+#             only collide inside the LOD 0 box. A layout change keeps the chunks it dropped
+#             (_outgoing) visible until everything replacing them is ready (_is_ready), hiding
+#             those results meanwhile.
 
 @export var generator: VoxelGenerator:
 	set(value):
@@ -69,16 +72,18 @@ extends Node3D
 		procedural = value
 		_queue_rebuild()
 
-# Infinite only: chunks in [camera chunk - chunk_extent, camera chunk + chunk_extent) get meshes.
+# Without lod_extents, infinite only: chunks in [camera chunk - chunk_extent, camera chunk +
+# chunk_extent] get meshes. With lod_extents, the LOD 0 box half size (see there).
 @export var chunk_extent := Vector3i(2, 2, 2):
 	set(value):
 		chunk_extent = value
 		_queue_rebuild()
 
-# Infinite only: coarse rings around the chunk_extent box, one per entry, each at half the
-# resolution of the one inside it (LOD n chunks are 2^n times wider). An entry is the ring's half
-# size in its own chunks. With rings, every extent (chunk_extent too) is raised to an even count of
-# at least half the extent inside + 2, so rings nest on whole chunks (D-32). Empty: no LOD.
+# Coarse rings around the chunk_extent box, one per entry, each at half the resolution of the one
+# inside it (LOD n chunks are 2^n times wider). An entry is the ring's half size in its own chunks.
+# With rings, every extent (chunk_extent too) is raised to an even count of at least half the extent
+# inside + 2, so rings nest on whole chunks (D-32), and boxes follow the camera in contained worlds
+# too (clipped to the world). Empty: no LOD.
 @export var lod_extents: Array[Vector3i] = []:
 	set(value):
 		lod_extents = value
@@ -129,6 +134,8 @@ extends Node3D
 
 # sample_density above this is solid.
 const ISO_DENSITY := VoxelChunk.ISO / 255.0
+# Type of stored coarse copy samples no LOD 0 save has reached; palettes stay below it (INV-13).
+const UNSAVED := 255
 # Neighbour direction per face, in MarchingCubes face order.
 const DIRECTIONS: Array[Vector3i] = [
 	Vector3i.LEFT, Vector3i.RIGHT, Vector3i.DOWN, Vector3i.UP, Vector3i.FORWARD, Vector3i.BACK]
@@ -186,6 +193,13 @@ var _mask_dirty: Dictionary[Vector4i, bool] = {}
 # overrides are remeshed when this moves.
 var _loaded_begin := Vector3i.ZERO
 var _loaded_end := Vector3i.ZERO
+# Transition faces (MarchingCubes order bits) each coarse mesh in _lod_meshes was built with.
+var _lod_faces: Dictionary[Vector4i, int] = {}
+# Infinite with storage: region storages of the stored coarse copies, index = LOD ([0] unused), in
+# lod<n> subfolders of the storage directory (D-35).
+var _copy_storages: Array[VoxelRegionStorage] = []
+# Chunks set_voxel changed this frame; coarse chunks reading them are remeshed in _process.
+var _edited_chunks: Dictionary[Vector3i, bool] = {}
 
 
 # The worker writes result; the main thread reads it only after the task completes. cancelled is
@@ -196,6 +210,8 @@ class ChunkTask:
 	var cancelled := false
 	# Generation only: result came from storage rather than the generator.
 	var loaded := false
+	# Coarse meshing only: the transition faces it builds.
+	var faces := 0
 
 
 func _init() -> void:
@@ -209,7 +225,7 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	if infinite:
+	if infinite or _extents.size() > 1:
 		var center := _viewer_chunk()
 		if center != _center:
 			_center = center
@@ -217,6 +233,8 @@ func _process(_delta: float) -> void:
 	if _edits_pending and not infinite:
 		_edits_pending = false
 		_flush(true)
+	if not _edited_chunks.is_empty():
+		_requeue_edited_lods()
 	_finish_tasks()
 	_retire_outgoing()
 	_update_masks()
@@ -275,17 +293,8 @@ func set_voxel(world: Vector3i, density: float, type: int) -> void:
 					and padded.z < MarchingCubes.PADDED
 				if in_padded_grid and _is_meshed(neighbour):
 					_mesh_queue[neighbour] = true
-	# LOD 1 chunks next to the LOD 0 box read this chunk's samples (INV-11).
 	if _extents.size() > 1:
-		var lod_coord := _floor_div(coord, 2)
-		for z in range(-1, 2):
-			for y in range(-1, 2):
-				for x in range(-1, 2):
-					var key := Vector4i(lod_coord.x + x, lod_coord.y + y, lod_coord.z + z, 1)
-					var reach := _lod_reach(key, coord, coord + Vector3i.ONE)
-					if reach[0] != reach[1] and _is_lod_target(key) \
-							and (_lod_meshes.has(key) or _lod_tasks.has(key)):
-						_requeue_lod(key)
+		_edited_chunks[coord] = true
 
 
 # set_voxel for each index; the editor's undo/redo replays strokes through this.
@@ -417,6 +426,13 @@ func _rebuild() -> void:
 	_watch_types()
 	update_configuration_warnings()
 	_extents = _ring_extents()
+	_copy_storages.clear()
+	if infinite and _storage_snapshot != null and _extents.size() > 1:
+		_copy_storages.append(null)
+		for lod in range(1, _extents.size()):
+			var copies := storage.duplicate() as VoxelRegionStorage
+			copies.directory = storage.directory.path_join("lod%d" % lod)
+			_copy_storages.append(copies)
 	# LODs that no longer exist go at once.
 	for key in _lod_meshes.keys():
 		if key.w >= _extents.size():
@@ -467,9 +483,9 @@ func _refresh() -> void:
 			_chunks.erase(coord)
 	var mesh_coords := _mesh_queue.keys().filter(_is_meshed)
 	_generation_queue.clear()
-	# Covers both ranges: loaded reaches at most one chunk past the meshed range.
-	var begin := _mesh_begin() - Vector3i.ONE
-	var end := _mesh_end() + Vector3i.ONE
+	# Covers both ranges: loaded reaches one chunk past the meshed range, or the whole contained world.
+	var begin := (_mesh_begin() - Vector3i.ONE).min(_load_begin())
+	var end := (_mesh_end() + Vector3i.ONE).max(_load_end())
 	for z in range(begin.z, end.z):
 		for y in range(begin.y, end.y):
 			for x in range(begin.x, end.x):
@@ -488,9 +504,10 @@ func _refresh() -> void:
 		_mesh_queue[coord] = true
 	if _extents.size() <= 1:
 		return
-	# Only LOD 1 reaches loaded chunks: LOD 2 starts a whole LOD 1 chunk past the LOD 0 box.
-	var loaded_begin := _mesh_begin() - Vector3i.ONE
-	var loaded_end := _mesh_end() + Vector3i.ONE
+	# Only moves when infinite, where only LOD 1 reaches loaded chunks: LOD 2 starts a whole LOD 1
+	# chunk past the LOD 0 box.
+	var loaded_begin := _load_begin()
+	var loaded_end := _load_end()
 	if loaded_begin != _loaded_begin or loaded_end != _loaded_end:
 		for key: Vector4i in _lod_meshes.keys() + _lod_tasks.keys():
 			if key.w == 1 and _is_lod_target(key) and _lod_reach(key, _loaded_begin, _loaded_end) \
@@ -498,6 +515,21 @@ func _refresh() -> void:
 				_requeue_lod(key)
 		_loaded_begin = loaded_begin
 		_loaded_end = loaded_end
+	# Chunks next to a moved finer box need transition faces they were built without.
+	for lod in range(1, _extents.size()):
+		var shell_begin := _box_begin(lod - 1) / 2 - Vector3i.ONE
+		var shell_end := _box_end(lod - 1) / 2 + Vector3i.ONE
+		for z in range(shell_begin.z, shell_end.z):
+			for y in range(shell_begin.y, shell_end.y):
+				for x in range(shell_begin.x, shell_end.x):
+					var key := Vector4i(x, y, z, lod)
+					var built := -1
+					if _lod_tasks.has(key):
+						built = _lod_tasks[key].faces
+					elif _lod_meshes.has(key):
+						built = _lod_faces[key]
+					if built != -1 and _is_lod_target(key) and (_needed_faces(key) & ~built) != 0:
+						_requeue_lod(key)
 	var lod_keys := _lod_queue.keys().filter(_is_lod_target)
 	for lod in range(1, _extents.size()):
 		var lod_begin := _box_begin(lod)
@@ -543,7 +575,7 @@ func _finish_tasks() -> void:
 		var task: ChunkTask = _lod_tasks[key]
 		if _try_complete(task):
 			_lod_tasks.erase(key)
-			_apply_lod_mesh(key, task.result)
+			_apply_lod_mesh(key, task.result, task.faces)
 
 
 # Tasks in flight are capped at the core count (the pool's default size), so a rebuild or
@@ -561,7 +593,8 @@ func _start_tasks() -> void:
 		_save_queue.clear()
 		_save_task = ChunkTask.new()
 		_save_task.id = WorkerThreadPool.add_task(
-			_save_chunks.bind(_storage_snapshot, coords, chunk_densities, chunk_types))
+			_save_chunks.bind(_storage_snapshot, _copy_storages.duplicate(), coords, chunk_densities,
+				chunk_types))
 	var task_count := _abandoned_tasks.size() + _generation_tasks.size() + _mesh_tasks.size() \
 		+ _lod_tasks.size()
 	var free_slots := OS.get_processor_count() - task_count
@@ -620,8 +653,14 @@ func _start_tasks() -> void:
 			continue
 		_lod_queue.erase(key)
 		var task := ChunkTask.new()
-		task.id = WorkerThreadPool.add_task(
-			_mesh_lod_chunk.bind(task, _generator_snapshot, key, _lod_overrides(key)))
+		task.faces = _needed_faces(key)
+		# Contained worlds keep every chunk loaded: outside them is air, or clamped without
+		# outside_faces, never generated.
+		var lod_generator: VoxelGenerator = _generator_snapshot if infinite else null
+		var clamp_end := Vector3i.ZERO if infinite or outside_faces \
+			else _world_size() * VoxelChunk.SIZE
+		task.id = WorkerThreadPool.add_task(_mesh_lod_chunk.bind(task, lod_generator,
+			_copy_storages.duplicate(), key, task.faces, _lod_overrides(key), clamp_end))
 		_lod_tasks[key] = task
 		free_slots -= 1
 
@@ -657,10 +696,62 @@ func _generate_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator,
 
 # Worker thread: must not touch members. Gets copy-on-write sample arrays, not the chunks, because
 # a reclaimed chunk can be edited on the main thread while this runs.
-func _save_chunks(storage_snapshot: VoxelStorage, coords: Array[Vector3i],
-		chunk_densities: Array[PackedByteArray], chunk_types: Array[PackedByteArray]) -> void:
+func _save_chunks(storage_snapshot: VoxelStorage, copy_storages: Array[VoxelRegionStorage],
+		coords: Array[Vector3i], chunk_densities: Array[PackedByteArray],
+		chunk_types: Array[PackedByteArray]) -> void:
 	for index in coords.size():
 		storage_snapshot.save_chunk(coords[index], chunk_densities[index], chunk_types[index])
+	_update_copies(copy_storages, coords, chunk_densities, chunk_types)
+
+
+# Worker thread or main thread. Writes saved LOD 0 chunks into the stored coarse copies (D-35):
+# every copy sample at a position inside one of them takes its value, rescaled to the copy's band
+# (INV-11). A new copy starts as UNSAVED samples, which coarse sampling leaves to the generator.
+# Each touched copy is read and written once.
+static func _update_copies(copy_storages: Array[VoxelRegionStorage], coords: Array[Vector3i],
+		chunk_densities: Array[PackedByteArray], chunk_types: Array[PackedByteArray]) -> void:
+	for lod in range(1, copy_storages.size()):
+		var step := 1 << lod
+		var copy_size := VoxelChunk.SIZE * step
+		# Copy coordinate -> indices into coords of the chunks inside it.
+		var members := {}
+		for index in coords.size():
+			var copy_coord := _floor_div(coords[index], step)
+			if not members.has(copy_coord):
+				members[copy_coord] = []
+			members[copy_coord].append(index)
+		for copy_coord: Vector3i in members:
+			var copy := copy_storages[lod].load_chunk(copy_coord)
+			var densities := PackedByteArray()
+			var types := PackedByteArray()
+			if copy == null or copy.densities.is_empty():
+				densities.resize(VoxelChunk.VOLUME)
+				densities.fill(0)
+				types.resize(VoxelChunk.VOLUME)
+				types.fill(UNSAVED)
+			else:
+				densities = copy.densities
+				types = copy.types
+			for index: int in members[copy_coord]:
+				# The chunk's samples in this copy, [first, end) per axis.
+				var offset := coords[index] * VoxelChunk.SIZE - copy_coord * copy_size
+				var first := _ceil_div(offset, step)
+				var end := _ceil_div(offset + Vector3i.ONE * VoxelChunk.SIZE, step)
+				var source_densities := chunk_densities[index]
+				var source_types := chunk_types[index]
+				for z in range(first.z, end.z):
+					for y in range(first.y, end.y):
+						for x in range(first.x, end.x):
+							var sample := Vector3i(x, y, z)
+							var copy_index := VoxelChunk.sample_index(sample)
+							if source_densities.is_empty():
+								densities[copy_index] = 0
+								types[copy_index] = 0
+							else:
+								var source := VoxelChunk.sample_index(sample * step - offset)
+								densities[copy_index] = 128 + floori((source_densities[source] - 128) / float(step))
+								types[copy_index] = source_types[source]
+			copy_storages[lod].save_chunk(copy_coord, densities, types)
 
 
 # Worker thread: must not touch members. The arrays hold the 3x3x3 chunks around the meshed chunk,
@@ -744,16 +835,17 @@ func _apply_mesh(coord: Vector3i, result: Variant) -> void:
 		_place(key)
 
 
-# Worker thread: must not touch members. overrides: loaded LOD 0 chunks within reach, coord ->
-# [densities, types] (INV-11).
-func _mesh_lod_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator, key: Vector4i,
-		overrides: Dictionary) -> void:
+# Worker thread: must not touch members. faces: the transition faces to build. overrides: in-memory
+# LOD 0 chunks within reach, coord -> [densities, types] (INV-11). clamp_end: see _sample_grid.
+func _mesh_lod_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator,
+		copy_storages: Array[VoxelRegionStorage], key: Vector4i, faces: int, overrides: Dictionary,
+		clamp_end: Vector3i) -> void:
 	if task.cancelled:
 		return
 	var step := 1 << key.w
 	var origin := _xyz(key) * VoxelChunk.SIZE * step
-	var samples := _sample_grid(generator_snapshot, overrides, origin - Vector3i.ONE * step, step,
-		Vector3i.ONE * MarchingCubes.PADDED)
+	var samples := _sample_grid(generator_snapshot, _copies_of(copy_storages, key.w), overrides,
+		origin - Vector3i.ONE * step, step, Vector3i.ONE * MarchingCubes.PADDED, clamp_end)
 	# Saturated everywhere means at least BAND * step from any surface, so the slabs are too.
 	var volume := MarchingCubes.PADDED ** 3
 	if samples[0].count(0) == volume or samples[0].count(255) == volume:
@@ -763,8 +855,13 @@ func _mesh_lod_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator, key: V
 	# Transition cells read the finer LOD's samples: half the step, its band.
 	var fine_step := step >> 1
 	for face in 6:
-		var slab := _sample_grid(generator_snapshot, overrides,
-			origin + MarchingCubes.slab_origin(face) * fine_step, fine_step, MarchingCubes.slab_size(face))
+		if (faces & (1 << face)) == 0:
+			slab_densities.append(PackedByteArray())
+			slab_types.append(PackedByteArray())
+			continue
+		var slab := _sample_grid(generator_snapshot, _copies_of(copy_storages, key.w - 1), overrides,
+			origin + MarchingCubes.slab_origin(face) * fine_step, fine_step,
+			MarchingCubes.slab_size(face), clamp_end)
 		slab_densities.append(slab[0])
 		slab_types.append(slab[1])
 	if task.cancelled:
@@ -776,10 +873,13 @@ func _mesh_lod_chunk(task: ChunkTask, generator_snapshot: VoxelGenerator, key: V
 
 
 # Worker thread. [densities, types] of size samples step units apart from terrain-local origin, x
-# fastest: the generator's (air without one), except samples inside overrides chunks, which take the
-# loaded value rescaled to the grid's band. The rescale keeps which samples are solid (INV-11).
-static func _sample_grid(generator_snapshot: VoxelGenerator, overrides: Dictionary, origin: Vector3i,
-		step: int, size: Vector3i) -> Array[PackedByteArray]:
+# fastest. Later sources win: the generator (air without one); copies, the stored coarse copies of
+# this step's LOD, where not UNSAVED (INV-13); overrides, in-memory LOD 0 chunks rescaled to the
+# grid's band. The rescale keeps which samples are solid (INV-11). A non-zero clamp_end clamps
+# positions into [0, clamp_end) before reading overrides (contained, outside_faces off).
+static func _sample_grid(generator_snapshot: VoxelGenerator, copies: VoxelRegionStorage,
+		overrides: Dictionary, origin: Vector3i, step: int, size: Vector3i,
+		clamp_end: Vector3i) -> Array[PackedByteArray]:
 	var densities := PackedByteArray()
 	var types := PackedByteArray()
 	if generator_snapshot != null:
@@ -791,6 +891,33 @@ static func _sample_grid(generator_snapshot: VoxelGenerator, overrides: Dictiona
 		densities.fill(0)
 		types.resize(densities.size())
 		types.fill(0)
+	if copies != null:
+		var copy_size := VoxelChunk.SIZE * step
+		var first := _floor_div(origin, copy_size)
+		var last := _floor_div(origin + (size - Vector3i.ONE) * step, copy_size)
+		var stored := {}
+		for z in range(first.z, last.z + 1):
+			for y in range(first.y, last.y + 1):
+				for x in range(first.x, last.x + 1):
+					var copy := copies.load_chunk(Vector3i(x, y, z))
+					if copy != null and not copy.densities.is_empty():
+						stored[Vector3i(x, y, z)] = [copy.densities, copy.types]
+		if not stored.is_empty():
+			var stored_index := 0
+			for z in size.z:
+				for y in size.y:
+					for x in size.x:
+						var world := origin + Vector3i(x, y, z) * step
+						var copy_coord := _floor_div(world, copy_size)
+						if stored.has(copy_coord):
+							var copy_densities: PackedByteArray = stored[copy_coord][0]
+							var copy_types: PackedByteArray = stored[copy_coord][1]
+							var sample := VoxelChunk.sample_index(
+								_floor_div(world - copy_coord * copy_size, step))
+							if copy_types[sample] != UNSAVED:
+								densities[stored_index] = copy_densities[sample]
+								types[stored_index] = copy_types[sample]
+						stored_index += 1
 	if overrides.is_empty():
 		return [densities, types]
 	var index := 0
@@ -798,6 +925,8 @@ static func _sample_grid(generator_snapshot: VoxelGenerator, overrides: Dictiona
 		for y in size.y:
 			for x in size.x:
 				var world := origin + Vector3i(x, y, z) * step
+				if clamp_end != Vector3i.ZERO:
+					world = world.clamp(Vector3i.ZERO, clamp_end - Vector3i.ONE)
 				var coord := _chunk_coord(world)
 				if overrides.has(coord):
 					var source_densities: PackedByteArray = overrides[coord][0]
@@ -813,9 +942,15 @@ static func _sample_grid(generator_snapshot: VoxelGenerator, overrides: Dictiona
 	return [densities, types]
 
 
-# result is null for a coarse chunk without surface, else its ArrayMesh.
-func _apply_lod_mesh(key: Vector4i, result: Variant) -> void:
+static func _copies_of(copy_storages: Array[VoxelRegionStorage], lod: int) -> VoxelRegionStorage:
+	return copy_storages[lod] if lod >= 1 and lod < copy_storages.size() else null
+
+
+# result is null for a coarse chunk without surface, else its ArrayMesh. faces: the transition
+# faces it was built with.
+func _apply_lod_mesh(key: Vector4i, result: Variant, faces: int) -> void:
 	var placed := _lod_meshes.has(key)
+	_lod_faces[key] = faces
 	if result == null:
 		if _lod_meshes.get(key) != null:
 			_lod_meshes[key].queue_free()
@@ -874,12 +1009,15 @@ func _retire_outgoing() -> void:
 			_visibility_changed(key)
 
 
-# True when every chunk of the current layout inside key's space has a mesh result, with or
-# without surface. Boxes nest on whole chunks of the next LOD (D-32), so key's space is either
-# inside one coarser layout chunk or splits into its 8 children.
+# True when every chunk of the current layout inside key's space is ready (_is_ready). Boxes nest
+# on whole chunks of the next LOD (D-32), so key's space is either inside one coarser layout chunk
+# or splits into its 8 children.
 func _is_covered(key: Vector4i) -> bool:
 	if _is_target(key):
-		return _meshes.has(_xyz(key)) if key.w == 0 else _lod_meshes.has(key)
+		return _is_ready(key)
+	# Outside a contained world nothing replaces it.
+	if not _overlaps_world(key):
+		return true
 	if key.w > 0 and _is_in_box(_xyz(key), _box_begin(key.w - 1) / 2, _box_end(key.w - 1) / 2):
 		for child in 8:
 			var offset := Vector3i(child & 1, child >> 1 & 1, child >> 2)
@@ -892,6 +1030,26 @@ func _is_covered(key: Vector4i) -> bool:
 		return true
 	var parent := _floor_div(_xyz(key), 2)
 	return _is_covered(Vector4i(parent.x, parent.y, parent.z, key.w + 1))
+
+
+# Layout chunk key has a mesh result (with or without surface), and it and the coarser chunks next
+# to it have the transition faces the layout needs, so showing it opens no crack.
+func _is_ready(key: Vector4i) -> bool:
+	if key.w == 0:
+		if not _meshes.has(_xyz(key)):
+			return false
+	elif not _lod_meshes.has(key) or (_needed_faces(key) & ~_lod_faces[key]) != 0:
+		return false
+	var coord := _xyz(key)
+	var parent := _floor_div(coord, 2)
+	for face in 6:
+		var coarse := _floor_div(coord + DIRECTIONS[face], 2)
+		var coarse_key := Vector4i(coarse.x, coarse.y, coarse.z, key.w + 1)
+		# face ^ 1 is the opposite face: the coarse chunk's face toward this one.
+		if coarse != parent and _lod_meshes.has(coarse_key) and _is_lod_target(coarse_key) \
+				and (_lod_faces[coarse_key] & (1 << (face ^ 1))) == 0:
+			return false
+	return true
 
 
 func _add_outgoing(key: Vector4i) -> void:
@@ -934,6 +1092,7 @@ func _free_mesh(key: Vector4i) -> void:
 		_meshes.erase(_xyz(key))
 	else:
 		_lod_meshes.erase(key)
+		_lod_faces.erase(key)
 
 
 func _node(key: Vector4i) -> MeshInstance3D:
@@ -980,7 +1139,21 @@ func _transition_mask(key: Vector4i) -> int:
 		var shown := _meshes.has(child) if key.w == 1 else _lod_meshes.has(child_key)
 		if shown and not _hidden.has(child_key):
 			mask |= 1 << face
-	return mask
+	# A face built without transition cells stays closed (_is_ready keeps that from cracking).
+	return mask & _lod_faces.get(key, 0)
+
+
+# Faces of coarse chunk key bordering the finer box: only there can a finer neighbour be shown.
+func _needed_faces(key: Vector4i) -> int:
+	var hole_begin := _box_begin(key.w - 1) / 2
+	var hole_end := _box_end(key.w - 1) / 2
+	var faces := 0
+	for face in 6:
+		var neighbour := _xyz(key) + DIRECTIONS[face]
+		if _is_in_box(neighbour, hole_begin, hole_end) \
+				and _overlaps_world(Vector4i(neighbour.x, neighbour.y, neighbour.z, key.w)):
+			faces |= 1 << face
+	return faces
 
 
 # Coarse chunk key is part of the current layout: inside its LOD's box, outside the finer one.
@@ -989,11 +1162,43 @@ func _is_lod_target(key: Vector4i) -> bool:
 		return false
 	var coord := _xyz(key)
 	return _is_in_box(coord, _box_begin(key.w), _box_end(key.w)) \
-		and not _is_in_box(coord, _box_begin(key.w - 1) / 2, _box_end(key.w - 1) / 2)
+		and not _is_in_box(coord, _box_begin(key.w - 1) / 2, _box_end(key.w - 1) / 2) \
+		and _overlaps_world(key)
+
+
+# Contained only (always true when infinite): whether key's space overlaps the meshed world range,
+# chunk -1 included with outside_faces.
+func _overlaps_world(key: Vector4i) -> bool:
+	if infinite:
+		return true
+	var size := 1 << key.w
+	var begin := _xyz(key) * size
+	var world_begin := -Vector3i.ONE if outside_faces else Vector3i.ZERO
+	var world_end := _world_size()
+	return begin.x < world_end.x and begin.y < world_end.y and begin.z < world_end.z \
+		and begin.x + size > world_begin.x and begin.y + size > world_begin.y \
+		and begin.z + size > world_begin.z
 
 
 func _is_target(key: Vector4i) -> bool:
 	return _is_meshed(_xyz(key)) if key.w == 0 else _is_lod_target(key)
+
+
+# Coarse chunks reading the samples of chunks edited this frame are remeshed (INV-11). In infinite
+# worlds only LOD 1 next to the LOD 0 box reaches loaded chunks; contained ones keep every chunk.
+func _requeue_edited_lods() -> void:
+	for coord in _edited_chunks:
+		for lod in range(1, _extents.size()):
+			var lod_coord := _floor_div(coord, 1 << lod)
+			for z in range(-1, 2):
+				for y in range(-1, 2):
+					for x in range(-1, 2):
+						var key := Vector4i(lod_coord.x + x, lod_coord.y + y, lod_coord.z + z, lod)
+						var reach := _lod_reach(key, coord, coord + Vector3i.ONE)
+						if reach[0] != reach[1] and _is_lod_target(key) \
+								and (_lod_meshes.has(key) or _lod_tasks.has(key)):
+							_requeue_lod(key)
+	_edited_chunks.clear()
 
 
 func _requeue_lod(key: Vector4i) -> void:
@@ -1003,21 +1208,27 @@ func _requeue_lod(key: Vector4i) -> void:
 	_lod_queue[key] = true
 
 
-# LOD 0 chunks inside [begin, end) that coarse chunk key samples, as [begin, end), both zero when
-# none. Its padded grid reaches one coarse step past the chunk; the slabs stay within that.
-func _lod_reach(key: Vector4i, begin: Vector3i, end: Vector3i) -> Array[Vector3i]:
+# LOD 0 chunks coarse chunk key samples, [begin, end): its padded grid reaches one coarse step past
+# the chunk; the slabs stay within that.
+static func _lod_span(key: Vector4i) -> Array[Vector3i]:
 	var step := 1 << key.w
 	var origin := _xyz(key) * VoxelChunk.SIZE * step
-	var reach_begin := _chunk_coord(origin - Vector3i.ONE * step).max(begin)
-	var reach_end := (_chunk_coord(origin + Vector3i.ONE * (VoxelChunk.SIZE + 1) * step)
-		+ Vector3i.ONE).min(end)
+	return [_chunk_coord(origin - Vector3i.ONE * step),
+		_chunk_coord(origin + Vector3i.ONE * (VoxelChunk.SIZE + 1) * step) + Vector3i.ONE]
+
+
+# The part of _lod_span(key) inside [begin, end), both zero when none.
+func _lod_reach(key: Vector4i, begin: Vector3i, end: Vector3i) -> Array[Vector3i]:
+	var span := _lod_span(key)
+	var reach_begin := span[0].max(begin)
+	var reach_end := span[1].min(end)
 	if reach_begin.x >= reach_end.x or reach_begin.y >= reach_end.y or reach_begin.z >= reach_end.z:
 		return [Vector3i.ZERO, Vector3i.ZERO]
 	return [reach_begin, reach_end]
 
 
 func _has_lod_overrides(key: Vector4i) -> bool:
-	var reach := _lod_reach(key, _loaded_begin, _loaded_end)
+	var reach := _lod_reach(key, _load_begin(), _load_end())
 	for z in range(reach[0].z, reach[1].z):
 		for y in range(reach[0].y, reach[1].y):
 			for x in range(reach[0].x, reach[1].x):
@@ -1026,16 +1237,23 @@ func _has_lod_overrides(key: Vector4i) -> bool:
 	return true
 
 
-# Loaded chunks coarse chunk key samples, coord -> [densities, types]; copy-on-write snapshots for
-# the worker, as in _start_tasks.
+# In-memory chunks coarse chunk key samples, coord -> [densities, types]; copy-on-write snapshots
+# for the worker, as in _start_tasks.
 func _lod_overrides(key: Vector4i) -> Dictionary:
 	var overrides := {}
-	var reach := _lod_reach(key, _loaded_begin, _loaded_end)
+	var reach := _lod_reach(key, _load_begin(), _load_end())
 	for z in range(reach[0].z, reach[1].z):
 		for y in range(reach[0].y, reach[1].y):
 			for x in range(reach[0].x, reach[1].x):
 				var chunk: VoxelChunk = _chunks[Vector3i(x, y, z)]
 				overrides[Vector3i(x, y, z)] = [chunk.densities, chunk.types]
+	# Unloaded chunks whose save has not finished are newer than the stored copies.
+	var span := _lod_span(key)
+	for pending in [_save_queue, _saving]:
+		for coord: Vector3i in pending:
+			if _is_in_box(coord, span[0], span[1]):
+				var chunk: VoxelChunk = pending[coord]
+				overrides[coord] = [chunk.densities, chunk.types]
 	return overrides
 
 
@@ -1171,12 +1389,22 @@ func _flush(edited_only: bool) -> void:
 			push_warning("VoxelTerrain: no storage directory selected; %d chunks were not saved."
 				% coords.size())
 		return
+	var saved_coords: Array[Vector3i] = []
+	var saved_densities: Array[PackedByteArray] = []
+	var saved_types: Array[PackedByteArray] = []
 	for coord in _save_queue:
 		_storage_snapshot.save_chunk(coord, _save_queue[coord].densities, _save_queue[coord].types)
+		saved_coords.append(coord)
+		saved_densities.append(_save_queue[coord].densities)
+		saved_types.append(_save_queue[coord].types)
 	_save_queue.clear()
 	for coord in coords:
 		_storage_snapshot.save_chunk(coord, _chunks[coord].densities, _chunks[coord].types)
+		saved_densities.append(_chunks[coord].densities)
+		saved_types.append(_chunks[coord].types)
 		_unsaved.erase(coord)
+	saved_coords.append_array(coords)
+	_update_copies(_copy_storages, saved_coords, saved_densities, saved_types)
 
 
 # Contained only: chunks along each axis, from the model (zero until the first rebuild creates it).
@@ -1189,7 +1417,7 @@ func _world_size() -> Vector3i:
 # around it wherever the camera is and chunks only border chunks one LOD apart.
 func _ring_extents() -> Array[Vector3i]:
 	var extents: Array[Vector3i] = [chunk_extent]
-	if not infinite or lod_extents.is_empty():
+	if lod_extents.is_empty():
 		return extents
 	extents[0] = chunk_extent + chunk_extent % 2
 	for extent in lod_extents:
@@ -1198,18 +1426,25 @@ func _ring_extents() -> Array[Vector3i]:
 	return extents
 
 
-# Infinite: the box of LOD lod in its chunk coordinates is [_box_begin(lod), _box_end(lod)). With
-# rings it is centred on the camera snapped to the next LOD's chunks, so it is whole chunks of it.
+# The box of LOD lod in its chunk coordinates is [_box_begin(lod), _box_end(lod)). Without rings
+# (infinite only) the camera chunk is its middle chunk.
 func _box_begin(lod: int) -> Vector3i:
 	if _extents.size() <= 1:
 		return _center - chunk_extent
-	return _floor_div(_center, 2 << lod) * 2 - _extents[lod]
+	return _box_center(lod) - _extents[lod]
 
 
 func _box_end(lod: int) -> Vector3i:
 	if _extents.size() <= 1:
-		return _center + chunk_extent
-	return _floor_div(_center, 2 << lod) * 2 + _extents[lod]
+		return _center + chunk_extent + Vector3i.ONE
+	return _box_center(lod) + _extents[lod]
+
+
+# Even, in LOD lod chunk coordinates: the corner of the next LOD's chunks nearest the camera, so the
+# box is whole chunks of the next LOD and its centre is at most one chunk of this LOD off the
+# camera's.
+func _box_center(lod: int) -> Vector3i:
+	return _floor_div(_center + Vector3i.ONE * (1 << lod), 2 << lod) * 2
 
 
 # Chunks that get a mesh are [_mesh_begin(), _mesh_end()) per axis.
@@ -1217,23 +1452,32 @@ func _mesh_begin() -> Vector3i:
 	if infinite:
 		return _box_begin(0)
 	# The closing faces on the low sides lie in the last cells of chunk -1 (cells span sample n..n+1).
-	return -Vector3i.ONE if outside_faces else Vector3i.ZERO
+	var world_begin := -Vector3i.ONE if outside_faces else Vector3i.ZERO
+	return world_begin if _extents.size() <= 1 else world_begin.max(_box_begin(0))
 
 
 func _mesh_end() -> Vector3i:
-	return _box_end(0) if infinite else _world_size()
+	if infinite:
+		return _box_end(0)
+	return _world_size() if _extents.size() <= 1 else _world_size().min(_box_end(0))
 
 
 func _is_meshed(coord: Vector3i) -> bool:
 	return _is_in_box(coord, _mesh_begin(), _mesh_end())
 
 
-# Chunks whose data is kept in _chunks.
+# Chunks whose data is kept in _chunks are [_load_begin(), _load_end()): when infinite one chunk past
+# the meshed range, since meshes read their neighbours' samples (INV-7); the whole contained world.
+func _load_begin() -> Vector3i:
+	return _mesh_begin() - Vector3i.ONE if infinite else Vector3i.ZERO
+
+
+func _load_end() -> Vector3i:
+	return _mesh_end() + Vector3i.ONE if infinite else _world_size()
+
+
 func _is_loaded(coord: Vector3i) -> bool:
-	if infinite:
-		# One chunk past the meshed range: meshes read their neighbours' samples (INV-7).
-		return _is_in_box(coord, _mesh_begin() - Vector3i.ONE, _mesh_end() + Vector3i.ONE)
-	return _is_in_box(coord, Vector3i.ZERO, _world_size())
+	return _is_in_box(coord, _load_begin(), _load_end())
 
 
 func _is_outside_world(coord: Vector3i) -> bool:
@@ -1276,6 +1520,10 @@ func _viewer_chunk() -> Vector3i:
 
 static func _xyz(key: Vector4i) -> Vector3i:
 	return Vector3i(key.x, key.y, key.z)
+
+
+static func _ceil_div(value: Vector3i, divisor: int) -> Vector3i:
+	return -_floor_div(-value, divisor)
 
 
 static func _floor_div(value: Vector3i, divisor: int) -> Vector3i:

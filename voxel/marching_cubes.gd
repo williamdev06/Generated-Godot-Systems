@@ -86,7 +86,8 @@ class _Surface:
 # three voxel types (CUSTOM0 rgb, in triangle corner order) and its barycentric weight for them
 # (COLOR), which voxel_terrain.gdshader blends by (D-23). Arrays rather than an ArrayMesh so the
 # caller can also build collision from them: reading an ArrayMesh back is a GPU readback.
-# slab_densities/slab_types: empty, or one slab per face (face order) to build transition cells from.
+# slab_densities/slab_types: empty, or one slab per face (face order) to build transition cells from;
+# an empty slab builds none on that face.
 static func build_arrays(densities: PackedByteArray, types: PackedByteArray,
 		slab_densities: Array[PackedByteArray] = [], slab_types: Array[PackedByteArray] = []) -> Array:
 	var surface := _Surface.new()
@@ -115,6 +116,8 @@ static func build_arrays(densities: PackedByteArray, types: PackedByteArray,
 						surface.add_triangle(triangle)
 				cell_index += 1
 	for face in slab_densities.size():
+		if slab_densities[face].is_empty():
+			continue
 		_add_transition_cells(surface, densities, types, face, slab_densities[face], slab_types[face])
 	if surface.vertices.is_empty():
 		return []
