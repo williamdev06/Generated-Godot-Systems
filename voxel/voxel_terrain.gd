@@ -200,6 +200,13 @@ var _lod_faces: Dictionary[Vector4i, int] = {}
 var _copy_storages: Array[VoxelRegionStorage] = []
 # Chunks set_voxel changed this frame; coarse chunks reading them are remeshed in _process.
 var _edited_chunks: Dictionary[Vector3i, bool] = {}
+# With rings: each LOD's box, cached by _update_boxes since box tests run thousands of times a frame.
+var _box_begins: Array[Vector3i] = []
+var _box_ends: Array[Vector3i] = []
+# Per LOD: its box or the finer one moved at the last _update_boxes, so _refresh redoes its ring.
+var _lod_moved: Array[bool] = []
+# A mesh result arrived or the layout moved since _retire_outgoing last looked.
+var _outgoing_dirty := false
 
 
 # The worker writes result; the main thread reads it only after the task completes. cancelled is
@@ -229,7 +236,9 @@ func _process(_delta: float) -> void:
 		var center := _viewer_chunk()
 		if center != _center:
 			_center = center
-			_refresh()
+			# With rings, boxes move in steps of 2^(lod + 1) chunks; most crossings move none.
+			if _extents.size() <= 1 or _update_boxes():
+				_refresh()
 	if _edits_pending and not infinite:
 		_edits_pending = false
 		_flush(true)
@@ -426,6 +435,9 @@ func _rebuild() -> void:
 	_watch_types()
 	update_configuration_warnings()
 	_extents = _ring_extents()
+	# Every LOD counts as moved, so _refresh redoes every ring.
+	_box_begins.clear()
+	_update_boxes()
 	_copy_storages.clear()
 	if infinite and _storage_snapshot != null and _extents.size() > 1:
 		_copy_storages.append(null)
@@ -447,6 +459,8 @@ func _rebuild() -> void:
 	# Existing meshes stay visible until their replacement arrives, so a rebuild does not flicker.
 	for coord in _meshes:
 		_mesh_queue[coord] = true
+	# Rebuilt from the kept meshes: queued keys may belong to LODs that no longer exist.
+	_lod_queue.clear()
 	for key in _lod_meshes:
 		_lod_queue[key] = true
 	_refresh()
@@ -460,15 +474,16 @@ func _refresh() -> void:
 	for coord in _meshes.keys():
 		if not _is_meshed(coord):
 			_retire(Vector4i(coord.x, coord.y, coord.z, 0))
+	_outgoing_dirty = true
 	for key in _lod_meshes.keys():
-		if not _is_lod_target(key):
+		if _lod_moved[key.w] and not _is_lod_target(key):
 			_retire(key)
 	for coord in _mesh_tasks.keys():
 		if not _is_meshed(coord):
 			_cancel(_mesh_tasks[coord])
 			_mesh_tasks.erase(coord)
 	for key in _lod_tasks.keys():
-		if not _is_lod_target(key):
+		if _lod_moved[key.w] and not _is_lod_target(key):
 			_cancel(_lod_tasks[key])
 			_lod_tasks.erase(key)
 	for coord in _generation_tasks.keys():
@@ -497,8 +512,8 @@ func _refresh() -> void:
 					and not _mesh_queue.has(coord)
 				if needs_mesh and _is_meshed(coord):
 					mesh_coords.append(coord)
-	_generation_queue.sort_custom(_is_nearer)
-	mesh_coords.sort_custom(_is_nearer)
+	_generation_queue.assign(_nearest_first(_generation_queue))
+	mesh_coords = _nearest_first(mesh_coords)
 	_mesh_queue.clear()
 	for coord in mesh_coords:
 		_mesh_queue[coord] = true
@@ -517,6 +532,8 @@ func _refresh() -> void:
 		_loaded_end = loaded_end
 	# Chunks next to a moved finer box need transition faces they were built without.
 	for lod in range(1, _extents.size()):
+		if not _lod_moved[lod]:
+			continue
 		var shell_begin := _box_begin(lod - 1) / 2 - Vector3i.ONE
 		var shell_end := _box_end(lod - 1) / 2 + Vector3i.ONE
 		for z in range(shell_begin.z, shell_end.z):
@@ -530,8 +547,13 @@ func _refresh() -> void:
 						built = _lod_faces[key]
 					if built != -1 and _is_lod_target(key) and (_needed_faces(key) & ~built) != 0:
 						_requeue_lod(key)
-	var lod_keys := _lod_queue.keys().filter(_is_lod_target)
+	var lod_keys := []
+	for key: Vector4i in _lod_queue:
+		if not _lod_moved[key.w] or _is_lod_target(key):
+			lod_keys.append(key)
 	for lod in range(1, _extents.size()):
+		if not _lod_moved[lod]:
+			continue
 		var lod_begin := _box_begin(lod)
 		var lod_end := _box_end(lod)
 		var hole_begin := _box_begin(lod - 1) / 2
@@ -544,7 +566,7 @@ func _refresh() -> void:
 					var key := Vector4i(x, y, z, lod)
 					if not _lod_meshes.has(key) and not _lod_tasks.has(key) and not _lod_queue.has(key):
 						lod_keys.append(key)
-	lod_keys.sort_custom(_is_nearer_lod)
+	lod_keys = _nearest_first(lod_keys)
 	_lod_queue.clear()
 	for key in lod_keys:
 		_lod_queue[key] = true
@@ -809,6 +831,7 @@ func _mesh_chunk(task: ChunkTask, chunk_densities: Array[PackedByteArray],
 
 # result is null for a chunk without surface, else [ArrayMesh, collision faces].
 func _apply_mesh(coord: Vector3i, result: Variant) -> void:
+	_outgoing_dirty = true
 	var key := Vector4i(coord.x, coord.y, coord.z, 0)
 	var placed := _meshes.has(coord)
 	if result == null:
@@ -949,6 +972,7 @@ static func _copies_of(copy_storages: Array[VoxelRegionStorage], lod: int) -> Vo
 # result is null for a coarse chunk without surface, else its ArrayMesh. faces: the transition
 # faces it was built with.
 func _apply_lod_mesh(key: Vector4i, result: Variant, faces: int) -> void:
+	_outgoing_dirty = true
 	var placed := _lod_meshes.has(key)
 	_lod_faces[key] = faces
 	if result == null:
@@ -993,6 +1017,10 @@ func _retire(key: Vector4i) -> void:
 # Frees outgoing chunks whose space the layout has fully meshed, then shows what they hid. Both
 # happen in the same frame, so nothing flickers.
 func _retire_outgoing() -> void:
+	# Coverage only changes when a result arrives or the layout moves.
+	if not _outgoing_dirty:
+		return
+	_outgoing_dirty = false
 	var retired := false
 	for key in _outgoing.keys():
 		if _is_covered(key):
@@ -1247,7 +1275,10 @@ func _lod_overrides(key: Vector4i) -> Dictionary:
 			for x in range(reach[0].x, reach[1].x):
 				var chunk: VoxelChunk = _chunks[Vector3i(x, y, z)]
 				overrides[Vector3i(x, y, z)] = [chunk.densities, chunk.types]
-	# Unloaded chunks whose save has not finished are newer than the stored copies.
+	# Unloaded chunks whose save has not finished are newer than the stored copies. They lie within
+	# two chunks of the LOD 0 box, which, like loaded chunks, only LOD 1 reaches.
+	if key.w != 1:
+		return overrides
 	var span := _lod_span(key)
 	for pending in [_save_queue, _saving]:
 		for coord: Vector3i in pending:
@@ -1431,13 +1462,32 @@ func _ring_extents() -> Array[Vector3i]:
 func _box_begin(lod: int) -> Vector3i:
 	if _extents.size() <= 1:
 		return _center - chunk_extent
-	return _box_center(lod) - _extents[lod]
+	return _box_begins[lod]
 
 
 func _box_end(lod: int) -> Vector3i:
 	if _extents.size() <= 1:
 		return _center + chunk_extent + Vector3i.ONE
-	return _box_center(lod) + _extents[lod]
+	return _box_ends[lod]
+
+
+# Recomputes the cached boxes from _center and _extents and sets _lod_moved; true when any moved.
+func _update_boxes() -> bool:
+	var begins: Array[Vector3i] = []
+	var ends: Array[Vector3i] = []
+	for lod in _extents.size():
+		begins.append(_box_center(lod) - _extents[lod])
+		ends.append(_box_center(lod) + _extents[lod])
+	var box_moved: Array[bool] = []
+	for lod in _extents.size():
+		box_moved.append(_box_begins.size() != _extents.size() or begins[lod] != _box_begins[lod]
+			or ends[lod] != _box_ends[lod])
+	_lod_moved.clear()
+	for lod in _extents.size():
+		_lod_moved.append(box_moved[lod] or (lod > 0 and box_moved[lod - 1]))
+	_box_begins = begins
+	_box_ends = ends
+	return _lod_moved.has(true)
 
 
 # Even, in LOD lod chunk coordinates: the corner of the next LOD's chunks nearest the camera, so the
@@ -1489,19 +1539,29 @@ func _is_in_box(coord: Vector3i, begin: Vector3i, end: Vector3i) -> bool:
 		and coord.z >= begin.z and coord.z < end.z
 
 
-func _is_nearer(a: Vector3i, b: Vector3i) -> bool:
-	return (a - _center).length_squared() < (b - _center).length_squared()
+# keys (LOD 0 coordinates or coarse keys) by _distance_key, nearest first. Sorted natively:
+# sort_custom calls back into GDScript for every comparison, which stalled frames on thousands.
+func _nearest_first(keys: Array) -> Array:
+	var order := PackedInt64Array()
+	order.resize(keys.size())
+	for index in keys.size():
+		# The index rides in the low 24 bits; distances stay far below 2^39.
+		order[index] = (_distance_key(keys[index]) << 24) | index
+	order.sort()
+	var sorted := []
+	sorted.resize(keys.size())
+	for index in order.size():
+		sorted[index] = keys[order[index] & 0xFFFFFF]
+	return sorted
 
 
-# By chunk centre distance to the camera's chunk centre, in LOD 0 chunks.
-func _is_nearer_lod(a: Vector4i, b: Vector4i) -> bool:
-	return _lod_distance(a) < _lod_distance(b)
-
-
-func _lod_distance(key: Vector4i) -> float:
-	var size := float(1 << key.w)
-	return ((Vector3(_xyz(key)) + Vector3.ONE * 0.5) * size - Vector3(_center) - Vector3.ONE * 0.5) \
-		.length_squared()
+# Squared distance between the camera chunk's centre and the chunk's, in half LOD 0 chunks so it
+# stays an integer. key: a LOD 0 coordinate (Vector3i) or a coarse key (Vector4i).
+func _distance_key(key: Variant) -> int:
+	if key is Vector4i:
+		var size: int = 1 << key.w
+		return ((_xyz(key) * 2 + Vector3i.ONE) * size - _center * 2 - Vector3i.ONE).length_squared()
+	return ((key - _center) * 2).length_squared()
 
 
 # The editor camera in the editor, the current camera in game; keeps the last centre without one.
