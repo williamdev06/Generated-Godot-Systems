@@ -1,12 +1,12 @@
-[gd_scene format=4 uid="uid://cxu1cawi3jk1o"]
+[gd_scene format=3 uid="uid://cxu1cawi3jk1o"]
 
 [ext_resource type="Script" uid="uid://5g0k2mlhrw5f" path="res://voxel/voxel_terrain.gd" id="1_terrain"]
 [ext_resource type="Script" uid="uid://bbss7b723k3e0" path="res://voxel/voxel_generator.gd" id="2_generator"]
-[ext_resource type="Script" path="res://voxel/voxel_region_storage.gd" id="7_storage"]
-[ext_resource type="Script" path="res://voxel/voxel_type.gd" id="3_type"]
+[ext_resource type="Script" uid="uid://bmrm7l3scohoj" path="res://voxel/voxel_type.gd" id="3_type"]
 [ext_resource type="Resource" path="res://voxel/demo/dirt.tres" id="4_dirt"]
 [ext_resource type="Resource" path="res://voxel/demo/grass.tres" id="5_grass"]
 [ext_resource type="Resource" path="res://voxel/demo/stone.tres" id="6_stone"]
+[ext_resource type="Script" path="res://voxel/demo/player.gd" id="7_player"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_main"]
 
@@ -24,9 +24,9 @@ ambient_light_source = 3
 script = ExtResource("2_generator")
 noise = SubResource("FastNoiseLite_terrain")
 
-[sub_resource type="Resource" id="Resource_storage"]
-script = ExtResource("7_storage")
-directory = "user://voxel_demo"
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_player"]
+radius = 0.4
+height = 1.8
 
 [node name="Demo" type="Node3D" unique_id=1189873582]
 
@@ -40,9 +40,29 @@ shadow_enabled = true
 [node name="VoxelTerrain" type="Node3D" parent="." unique_id=742369495]
 script = ExtResource("1_terrain")
 generator = SubResource("Resource_generator")
-voxel_types = Array[ExtResource("3_type")]([ExtResource("4_dirt"), ExtResource("5_grass"), ExtResource("6_stone")])
-storage = SubResource("Resource_storage")
 chunk_extent = Vector3i(8, 6, 8)
+voxel_types = Array[ExtResource("3_type")]([ExtResource("4_dirt"), ExtResource("5_grass"), ExtResource("6_stone")])
 
-[node name="Camera3D" type="Camera3D" parent="." unique_id=1812778611]
-transform = Transform3D(1, 0, 0, 0, 0.832, 0.555, 0, -0.555, 0.832, 0, 40, 60)
+[node name="Player" type="CharacterBody3D" parent="." node_paths=PackedStringArray("terrain")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 60, 0)
+script = ExtResource("7_player")
+terrain = NodePath("../VoxelTerrain")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Player"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+shape = SubResource("CapsuleShape3D_player")
+
+[node name="Camera3D" type="Camera3D" parent="Player" unique_id=1812778611]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.6, 0)
+
+[node name="Crosshair" type="CenterContainer" parent="Player"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="Label" type="Label" parent="Player/Crosshair"]
+layout_mode = 2
+text = "+"

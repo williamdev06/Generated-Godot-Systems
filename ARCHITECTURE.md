@@ -23,7 +23,7 @@ Target: Windows, D3D12
 | M-8 | voxel/voxel_chunk.gd | Per-chunk byte samples and their saved encoding | none | active |
 | M-9 | voxel/voxel_generator.gd | Procedural chunk density and type | M-8, FastNoiseLite | active |
 | M-10 | voxel/marching_cubes.gd | Padded density grid to chunk mesh arrays | M-8 | active |
-| M-11 | voxel/demo/ | Reference scene for M-7 with M-9 | M-7, M-9, M-13 | active |
+| M-11 | voxel/demo/ | Reference scene and first-person player for M-7 | M-7, M-9, M-13, physics | active |
 | M-12 | addons/voxel_editor/ | Editor sculpt and voxel tools for M-7 | M-7, M-8, EditorPlugin | active |
 | M-13 | voxel/voxel_type.gd | Per voxel type texture (Resource) | none | active |
 | M-14 | voxel/voxel_terrain.gdshader | Triplanar per-type texturing, blended at type borders | M-7 texture array, M-10 vertex layout | active |
@@ -58,6 +58,7 @@ M-12 -> M-7: get_density (0..1)/get_type reads (missing or empty chunks read as 
 M-7 -> physics: per-chunk StaticBody3D (collision_layer) + ConcavePolygonShape3D of the mesh triangles (faces unrolled on the worker); replaced with the mesh in _apply_mesh
 callers -> M-7: sample_density / get_normal / raycast / push_out (terrain-local, main thread); load or generate missing chunks synchronously
 EditorUndoRedoManager -> M-7: set_voxels(worlds, densities, types) with a stroke's before/after values; on undo/redo
+M-11 player -> M-7: set_voxel (single sample, editor voxel tool pick) on left/right click; raycast once at spawn; push_out every physics frame
 
 ## INVARIANTS
 INV-1: Planet radii and transmittance/sky-view/panorama uv mappings are duplicated in shaders/atmosphere.glslinc, shaders/cloud_panorama.glsl and sky.gdshader. Change all, or the sky mismatches the clouds.
@@ -99,6 +100,9 @@ D-25 2026-10-28: Infinite worlds persist every generated or edited chunk through
 D-26 2026-10-28: Contained worlds save every chunk into a VoxelModel resource: built into the scene when none is assigned (auto-created, so the inspector's Save As / Make Unique turn it into an asset or back), or a shared asset written on editor scene save. Model and region files store the same VoxelChunk.encode payloads (INV-9) behind a VoxelStorage base class; contained edits reach the model every frame so duplicates capture them; closing without saving discards contained changes. Region writes use the first gap that fits and truncate the tail, so files no longer only grow.
 D-27 2026-10-28: A VoxelModel owns its contained world's world_size and voxel_types (moved off VoxelTerrain for contained worlds) so a reused model asset brings its size and palette; VoxelTerrain.voxel_types now applies to infinite worlds only and callers use get_voxel_types().
 D-28 2026-10-28: Two collision paths. Trimesh per chunk (exact match to the mesh) for physics bodies and visuals; density field queries (trilinear, no physics) for characters, items, unstuck and spawn, since they work before meshing and can push out of solid. Faces come from MarchingCubes arrays, not the ArrayMesh (GPU readback). Editor picking stays on D-21.
+D-29 2026-10-29: Checkerboard clouds (cloud_checkerboard, default on): clouds_raymarch traces one pixel per 2x2 block in Bayer order (cloud_current/cloud_distance are block-sized); clouds_temporal rebuilds full-res history, untraced pixels = clamped reprojected history, traced pixels use history share amount^4 so convergence matches. Raymarch 0.39-0.79 -> 0.12-0.22 ms at 1080p.
+D-30 2026-10-29: Inside the cloud layer the view march spaces samples exponentially from the camera (march_distance_km, 0.1 km near scale) instead of quadratically over the span, so near steps don't scale with the up-to-max-distance horizontal span. Outside the layer stays quadratic.
+D-31 2026-10-29: The demo player is a CharacterBody3D colliding with the chunk trimeshes, not a density-query controller (D-28 named density for characters), because move_and_slide gives slopes/floor/jump for free. Density push_out only keeps it out of solid where chunks are not meshed yet.
 
 ## OPEN
 2026-10-28: MSAA and XR/multiview are unsupported (only view 0, non-MSAA layers are read).

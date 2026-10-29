@@ -13,8 +13,8 @@
 shader = ExtResource("3_shader")
 shader_parameter/sky_view_lut = SubResource("Texture2DRD_y80xr")
 shader_parameter/cloud_panorama = SubResource("Texture2DRD_xscfv")
-shader_parameter/camera_altitude_km = 0.012215538024902344
-shader_parameter/refresh_index = 12324.0
+shader_parameter/camera_altitude_km = 0.5280806274414063
+shader_parameter/refresh_index = 59592.0
 shader_parameter/sun_disc_brightness = 30.0
 
 [sub_resource type="Sky" id="Sky_main"]
@@ -46,20 +46,19 @@ access_resolved_depth = false
 needs_motion_vectors = false
 needs_normal_roughness = false
 script = ExtResource("1_effect")
-coverage = 0.562
+coverage = 1.0
 density = 10.0
 shape_noise_scale_km = 8.7
 detail_noise_scale_km = 0.6000000000000001
 weather_noise_scale_km = 25.0
 self_shadow_distance_km = 6.0
 cloud_checkerboard = false
-cloud_steps = 32
 cloud_max_distance_km = 60.0
-haze = 12.76
 ground_albedo = Color(0.07, 0.07, 0.07, 1)
 shaft_intensity = 10.0
 shaft_distance_km = 32.0
 shaft_depth_slices = 64
+shaft_temporal_amount = 0.0
 cloud_ao_map_size_km = 32.0
 
 [sub_resource type="Compositor" id="Compositor_main"]
@@ -88,8 +87,8 @@ environment = SubResource("Environment_main")
 compositor = SubResource("Compositor_main")
 
 [node name="Sun" type="DirectionalLight3D" parent="." unique_id=1069946303]
-transform = Transform3D(0.92513704, -0.36460897, 0.105743304, -0.37961438, -0.8857066, 0.26723838, -0.0037799699, -0.28737384, -0.9578108, 0, 0, 0)
-light_color = Color(0.6672219, 0.497818, 0.30935305, 1)
+transform = Transform3D(0.49008232, -0.6444747, 0.58691716, -0.8641304, -0.27080202, 0.4241994, -0.11444743, -0.71506554, -0.68962526, 0, 0, 0)
+light_color = Color(0.8779738, 0.73471624, 0.55605465, 1)
 light_angular_distance = 1.98
 shadow_enabled = true
 directional_shadow_split_1 = 0.01
@@ -103,7 +102,6 @@ sun = NodePath("../Sun")
 world_environment = NodePath("../WorldEnvironment")
 
 [node name="Ground" type="MeshInstance3D" parent="." unique_id=702354748]
-visible = false
 mesh = SubResource("PlaneMesh_ground")
 surface_material_override/0 = SubResource("ShaderMaterial_ground")
 
